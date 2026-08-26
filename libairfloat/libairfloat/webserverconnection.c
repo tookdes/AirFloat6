@@ -48,6 +48,9 @@ struct web_server_connection_t {
     mutex_p mutex;
     bool is_connected;
     bool has_taken_off;
+    bool close_in_progress;
+    bool destroy_pending;
+    bool destroying;
     socket_p socket;
     web_server_p server;
     web_server_connection_request_callback request_callback;
@@ -103,6 +106,23 @@ struct web_server_connection_t* web_server_connection_create(socket_p socket, we
 }
 
 void web_server_connection_destroy(struct web_server_connection_t* wc) {
+    
+    mutex_lock(wc->mutex);
+    
+    if (wc->destroying) {
+        mutex_unlock(wc->mutex);
+        return;
+    }
+    
+    if (wc->close_in_progress) {
+        wc->destroy_pending = true;
+        mutex_unlock(wc->mutex);
+        return;
+    }
+    
+    wc->destroying = true;
+    
+    mutex_unlock(wc->mutex);
     
     web_server_connection_close(wc);
     
@@ -181,6 +201,10 @@ void web_server_connection_take_off(struct web_server_connection_t* wc) {
 
 void web_server_connection_close(struct web_server_connection_t* wc) {
     
+    web_server_connection_closed_callback closed_callback = NULL;
+    void* closed_callback_ctx = NULL;
+    bool should_close = false;
+    
     mutex_lock(wc->mutex);
     
     if (wc->is_connected) {
@@ -188,19 +212,36 @@ void web_server_connection_close(struct web_server_connection_t* wc) {
         log_message(LOG_INFO, "Client disconnected");
         
         wc->is_connected = false;
-        
-        socket_close(wc->socket);
-        
-        mutex_unlock(wc->mutex);
-        
-        if (wc->closed_callback != NULL)
-            wc->closed_callback(wc, wc->closed_callback_ctx);
-        
-        mutex_lock(wc->mutex);
+        wc->close_in_progress = true;
+        should_close = true;
+        closed_callback = wc->closed_callback;
+        closed_callback_ctx = wc->closed_callback_ctx;
         
     }
     
     mutex_unlock(wc->mutex);
+    
+    if (!should_close)
+        return;
+    
+    /* socket_close synchronously invokes the server's socket-closed callback.
+       Keep this connection alive until that callback and our own close callback
+       have both returned. */
+    socket_close(wc->socket);
+    
+    if (closed_callback != NULL)
+        closed_callback(wc, closed_callback_ctx);
+    
+    mutex_lock(wc->mutex);
+    
+    wc->close_in_progress = false;
+    bool should_destroy = wc->destroy_pending && !wc->destroying;
+    wc->destroy_pending = false;
+    
+    mutex_unlock(wc->mutex);
+    
+    if (should_destroy)
+        web_server_connection_destroy(wc);
     
 }
 
