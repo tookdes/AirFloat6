@@ -230,20 +230,30 @@ void web_server_stop(struct web_server_t* ws) {
         
         ws->is_running = false;
         
-        if (ws->socket_ipv4 != NULL) {
-            socket_destroy(ws->socket_ipv4);
-            ws->socket_ipv4 = NULL;
-        }
-        if (ws->socket_ipv6 != NULL) {
-            socket_destroy(ws->socket_ipv6);
-            ws->socket_ipv6 = NULL;
-        }
+        socket_p socket_ipv4 = ws->socket_ipv4;
+        socket_p socket_ipv6 = ws->socket_ipv6;
+        ws->socket_ipv4 = NULL;
+        ws->socket_ipv6 = NULL;
+        
+        mutex_unlock(ws->mutex);
+        
+        if (socket_ipv4 != NULL)
+            socket_destroy(socket_ipv4);
+        if (socket_ipv6 != NULL)
+            socket_destroy(socket_ipv6);
+        
+        mutex_lock(ws->mutex);
         
         while (ws->connection_count > 0) {
+            socket_p connection_socket = ws->connections[0].socket;
             mutex_unlock(ws->mutex);
-            socket_destroy(ws->connections[0].socket);
-            web_server_connection_destroy(ws->connections[0].web_connection);
+            socket_destroy(connection_socket);
             mutex_lock(ws->mutex);
+        }
+        
+        if (ws->connections != NULL) {
+            free(ws->connections);
+            ws->connections = NULL;
         }
         
         log_message(LOG_INFO, "Server stopped");
