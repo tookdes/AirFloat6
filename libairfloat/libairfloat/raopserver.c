@@ -114,7 +114,10 @@ struct raop_server_t* raop_server_create(struct raop_server_settings_t settings)
 
 void raop_server_destroy(struct raop_server_t* rs) {
     
+    raop_server_stop(rs);
+    
     web_server_destroy(rs->server);
+    settings_destroy(rs->settings);
     
     mutex_destroy(rs->mutex);
     
@@ -201,28 +204,43 @@ void raop_server_stop(struct raop_server_t* rs) {
     
     mutex_lock(rs->mutex);
     
-    if (rs->is_running) {
-        
-        rs->is_running = false;
-        
-        while (rs->sessions_count > 0) {
-            mutex_unlock(rs->mutex);
-            raop_session_destroy(rs->sessions[0]);
-            mutex_lock(rs->mutex);
-        }
-        
-        free(rs->sessions);
-        
-        rs->sessions = NULL;
-        rs->sessions_count = 0;
-        
-        zeroconf_raop_ad_destroy(rs->zeroconf_ad);
-        
-        web_server_stop(rs->server);
-        
-    }
+    bool was_running = rs->is_running;
+    rs->is_running = false;
+    
+    zeroconf_raop_ad_p zeroconf_ad = rs->zeroconf_ad;
+    rs->zeroconf_ad = NULL;
     
     mutex_unlock(rs->mutex);
+    
+    if (zeroconf_ad != NULL)
+        zeroconf_raop_ad_destroy(zeroconf_ad);
+    
+    if (was_running)
+        web_server_stop(rs->server);
+    
+    while (true) {
+        
+        mutex_lock(rs->mutex);
+        
+        if (rs->sessions_count == 0) {
+            if (rs->sessions != NULL) {
+                free(rs->sessions);
+                rs->sessions = NULL;
+            }
+            mutex_unlock(rs->mutex);
+            break;
+        }
+        
+        raop_session_p session = rs->sessions[0];
+        for (uint32_t i = 1 ; i < rs->sessions_count ; i++)
+            rs->sessions[i - 1] = rs->sessions[i];
+        rs->sessions_count--;
+        
+        mutex_unlock(rs->mutex);
+        
+        raop_session_destroy(session);
+        
+    }
     
 }
 
@@ -242,11 +260,13 @@ void raop_server_set_session_accept_callback(struct raop_server_t* rs, raop_serv
 
 void raop_server_session_ended(struct raop_server_t* rs, raop_session_p session) {
     
+    raop_session_p ended_session = NULL;
+    
     mutex_lock(rs->mutex);
     
     for (uint32_t i = 0 ; i < rs->sessions_count ; i++)
         if (rs->sessions[i] == session) {
-            raop_session_destroy(rs->sessions[i]);
+            ended_session = rs->sessions[i];
             for (uint32_t a = i + 1 ; a < rs->sessions_count ; a++)
                 rs->sessions[a - 1] = rs->sessions[a];
             rs->sessions_count--;
@@ -255,6 +275,8 @@ void raop_server_session_ended(struct raop_server_t* rs, raop_session_p session)
     
     mutex_unlock(rs->mutex);
     
+    if (ended_session != NULL)
+        raop_session_destroy(ended_session);
     
 }
 
