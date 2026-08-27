@@ -161,14 +161,14 @@ bool raop_server_is_recording(struct raop_server_t* rs) {
     bool ret = false;
     
     mutex_lock(rs->mutex);
-    uint32_t count = rs->sessions_count;
-    mutex_unlock(rs->mutex);
     
-    for (uint32_t i = 0 ; i < count ; i++)
+    for (uint32_t i = 0 ; i < rs->sessions_count ; i++)
         if (raop_session_is_recording(rs->sessions[i])) {
             ret = true;
             break;
         }
+    
+    mutex_unlock(rs->mutex);
     
     return ret;
     
@@ -182,21 +182,33 @@ struct raop_server_settings_t raop_server_get_settings(struct raop_server_t* rs)
 
 void raop_server_set_settings(struct raop_server_t* rs, struct raop_server_settings_t settings) {
     
+    mutex_lock(rs->mutex);
+    
     const char* old_name = settings_get_name(rs->settings);
-    char* old_name_c = (char*)malloc(strlen(old_name) + 1);
-    strcpy(old_name_c, old_name);
+    char* old_name_c = NULL;
+    if (old_name != NULL) {
+        old_name_c = (char*)malloc(strlen(old_name) + 1);
+        strcpy(old_name_c, old_name);
+    }
     
     settings_set_name(rs->settings, settings.name);
     settings_set_password(rs->settings, settings.password);
     
     const char* new_name = settings_get_name(rs->settings);
+    bool name_changed = ((old_name_c == NULL) != (new_name == NULL));
+    if (old_name_c != NULL && new_name != NULL)
+        name_changed = strcmp(old_name_c, new_name) != 0;
     
-    if (strcmp(old_name_c, new_name) != 0) {
-        zeroconf_raop_ad_destroy(rs->zeroconf_ad);
+    if (name_changed && rs->is_running) {
+        if (rs->zeroconf_ad != NULL)
+            zeroconf_raop_ad_destroy(rs->zeroconf_ad);
         rs->zeroconf_ad = zeroconf_raop_ad_create(sockaddr_get_port(web_server_get_local_end_point(rs->server, sockaddr_type_inet_4)), new_name);
     }
     
-    free(old_name_c);
+    if (old_name_c != NULL)
+        free(old_name_c);
+    
+    mutex_unlock(rs->mutex);
     
 }
 
