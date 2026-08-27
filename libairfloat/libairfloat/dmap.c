@@ -37,6 +37,8 @@
 
 #include "DMAP.h"
 
+#define DMAP_MAX_NESTING_DEPTH 32
+
 struct dmap_atom_type {
     const uint32_t tag;
     const char* const identifier;
@@ -208,558 +210,508 @@ const struct dmap_atom_type _atom_types[] = {
     { 'aeMk',     "com.apple.itunes.extended-media-kind",  dmap_type_long      },
     { 'aeAD',     "com.apple.itunes.adam-ids-array",       dmap_type_container },
     { 'aeSV',     "com.apple.itunes.music-sharing-version",dmap_type_long      },
-    
-    // AirPlay cust
-    
     { 'cmst',     "com.airfloat.nowplayingcontainer",      dmap_type_container },
     { 'caps',     "com.airfloat.nowplayingstatus",         dmap_type_char      },
-    
 };
 
 const uint32_t _atom_type_count = sizeof(_atom_types) / sizeof(struct dmap_atom_type);
 
 struct dmap_t* dmap_create() {
-    
     struct dmap_t* t = (struct dmap_t*)malloc(sizeof(struct dmap_t));
+    if (t == NULL)
+        return NULL;
     bzero(t, sizeof(struct dmap_t));
-    
     return t;
-    
 }
 
 void dmap_destroy(struct dmap_t* d) {
-    
+    if (d == NULL)
+        return;
     for (uint32_t i = 0 ; i < d->count ; i++) {
-        if (d->atoms[i].type == dmap_type_container)
-            dmap_destroy(d->atoms[i].container);
-        
-        if (d->atoms[i].buffer != NULL)
-            free(d->atoms[i].buffer);
-        
-    }
-    
-    if (d->count > 0)
-        free(d->atoms);
-    
-    free(d);
-    
-}
-
-void dmap_parse(struct dmap_t* d, const void* data, size_t data_size) {
-    
-    char* buffer = (char*)data;
-    size_t length = data_size;
-    
-    while (length > 0) {
-        
-        uint32_t frame_size;
-        uint32_t tag;
-        
-        memcpy(&frame_size, &buffer[4], sizeof(uint32_t));
-        memcpy(&tag, buffer, sizeof(uint32_t));
-        
-        frame_size = btml(frame_size);
-        tag = btml(tag);
-        
-        buffer += 8;
-        length -= 8;
-        
-        d->atoms = (struct dmap_atom*)realloc(d->atoms, sizeof(struct dmap_atom) * (d->count + 1));
-        bzero(&d->atoms[d->count], sizeof(struct dmap_atom));
-        
-        d->atoms[d->count].tag = tag;
-        d->atoms[d->count].type = dmap_type_for_tag(tag);
-        d->atoms[d->count].buffer = malloc(frame_size + 1);
-        ((char*)d->atoms[d->count].buffer)[frame_size] = '\0';
-        memcpy(d->atoms[d->count].buffer, buffer, frame_size);
-        d->atoms[d->count].size = frame_size;
-        
-        d->atoms[d->count].container = NULL;
-        if (d->atoms[d->count].type == dmap_type_container) {
-            struct dmap_t* container = dmap_create();
-            dmap_parse(container, buffer, frame_size);
-            d->atoms[d->count].container = container;
-        }
-        
-        d->count++;
-        
-        buffer += frame_size;
-        length -= frame_size;
-        
-    }
-    
-}
-
-struct dmap_t* dmap_copy(struct dmap_t* d) {
-    
-    struct dmap_t* ret = dmap_create();
-    
-    ret->count = d->count;
-    ret->atoms = (struct dmap_atom*)malloc(sizeof(struct dmap_atom) * d->count);
-    
-    for (uint32_t i = 0 ; i < d->count ; i++) {
-        
-        ret->atoms[i].tag = d->atoms[i].tag;
-        ret->atoms[i].type = d->atoms[i].type;
-        ret->atoms[i].buffer = NULL;
-        ret->atoms[i].size = d->atoms[i].size;
-        if (d->atoms[i].buffer != NULL) {
-            ret->atoms[i].buffer = malloc(d->atoms[i].size);
-            memcpy(ret->atoms[i].buffer, d->atoms[i].buffer, d->atoms[i].size);
-        }
         if (d->atoms[i].container != NULL)
-            ret->atoms[i].container = dmap_copy(d->atoms[i].container);
-        
+            dmap_destroy(d->atoms[i].container);
+        free(d->atoms[i].buffer);
     }
-    
-    return ret;
-    
+    free(d->atoms);
+    free(d);
 }
 
 dmap_type dmap_type_for_tag(uint32_t tag) {
-    
     for (uint32_t i = 0 ; i < _atom_type_count ; i++)
         if (_atom_types[i].tag == tag)
             return _atom_types[i].type;
-    
     return dmap_type_unknown;
-    
+}
+
+size_t _dmap_minimum_size_for_type(dmap_type type) {
+    switch (type) {
+        case dmap_type_char: return 1;
+        case dmap_type_short: return 2;
+        case dmap_type_long:
+        case dmap_type_date:
+        case dmap_type_version: return 4;
+        case dmap_type_longlong: return 8;
+        default: return 0;
+    }
+}
+
+bool _dmap_parse_internal(struct dmap_t* d, const void* data, size_t data_size, uint32_t depth) {
+    if (d == NULL || (data == NULL && data_size > 0) || depth > DMAP_MAX_NESTING_DEPTH)
+        return false;
+
+    const unsigned char* buffer = (const unsigned char*)data;
+    size_t length = data_size;
+
+    while (length > 0) {
+        if (length < 8)
+            return false;
+
+        uint32_t frame_size = 0;
+        uint32_t tag = 0;
+        memcpy(&tag, buffer, sizeof(uint32_t));
+        memcpy(&frame_size, buffer + 4, sizeof(uint32_t));
+        tag = btml(tag);
+        frame_size = btml(frame_size);
+
+        size_t payload_length = length - 8;
+        if ((size_t)frame_size > payload_length)
+            return false;
+
+        dmap_type type = dmap_type_for_tag(tag);
+        if ((size_t)frame_size < _dmap_minimum_size_for_type(type))
+            return false;
+
+        struct dmap_t* container = NULL;
+        if (type == dmap_type_container) {
+            if (depth >= DMAP_MAX_NESTING_DEPTH)
+                return false;
+            container = dmap_create();
+            if (container == NULL)
+                return false;
+            if (!_dmap_parse_internal(container, buffer + 8, frame_size, depth + 1)) {
+                dmap_destroy(container);
+                return false;
+            }
+        }
+
+        void* atom_buffer = malloc((size_t)frame_size + 1);
+        if (atom_buffer == NULL) {
+            dmap_destroy(container);
+            return false;
+        }
+        if (frame_size > 0)
+            memcpy(atom_buffer, buffer + 8, frame_size);
+        ((char*)atom_buffer)[frame_size] = '\0';
+
+        struct dmap_atom* atoms = (struct dmap_atom*)realloc(d->atoms, sizeof(struct dmap_atom) * (d->count + 1));
+        if (atoms == NULL) {
+            free(atom_buffer);
+            dmap_destroy(container);
+            return false;
+        }
+        d->atoms = atoms;
+
+        struct dmap_atom* atom = &d->atoms[d->count];
+        bzero(atom, sizeof(struct dmap_atom));
+        atom->tag = tag;
+        atom->type = type;
+        atom->buffer = atom_buffer;
+        atom->size = frame_size;
+        atom->container = container;
+        d->count++;
+
+        size_t consumed = 8 + (size_t)frame_size;
+        buffer += consumed;
+        length -= consumed;
+    }
+
+    return true;
+}
+
+void dmap_parse(struct dmap_t* d, const void* data, size_t data_size) {
+    if (d == NULL || (data == NULL && data_size > 0))
+        return;
+
+    struct dmap_t* parsed = dmap_create();
+    if (parsed == NULL)
+        return;
+
+    if (!_dmap_parse_internal(parsed, data, data_size, 0)) {
+        dmap_destroy(parsed);
+        return;
+    }
+
+    if (parsed->count > 0) {
+        struct dmap_atom* atoms = (struct dmap_atom*)realloc(d->atoms, sizeof(struct dmap_atom) * (d->count + parsed->count));
+        if (atoms == NULL) {
+            dmap_destroy(parsed);
+            return;
+        }
+        d->atoms = atoms;
+        memcpy(&d->atoms[d->count], parsed->atoms, sizeof(struct dmap_atom) * parsed->count);
+        d->count += parsed->count;
+        free(parsed->atoms);
+        parsed->atoms = NULL;
+        parsed->count = 0;
+    }
+
+    dmap_destroy(parsed);
+}
+
+struct dmap_t* dmap_copy(struct dmap_t* d) {
+    if (d == NULL)
+        return NULL;
+    struct dmap_t* ret = dmap_create();
+    if (ret == NULL)
+        return NULL;
+    for (uint32_t i = 0 ; i < d->count ; i++) {
+        struct dmap_atom* atoms = (struct dmap_atom*)realloc(ret->atoms, sizeof(struct dmap_atom) * (ret->count + 1));
+        if (atoms == NULL) {
+            dmap_destroy(ret);
+            return NULL;
+        }
+        ret->atoms = atoms;
+        struct dmap_atom* atom = &ret->atoms[ret->count];
+        bzero(atom, sizeof(struct dmap_atom));
+        atom->tag = d->atoms[i].tag;
+        atom->type = d->atoms[i].type;
+        atom->size = d->atoms[i].size;
+        if (d->atoms[i].buffer != NULL) {
+            atom->buffer = malloc(d->atoms[i].size + 1);
+            if (atom->buffer == NULL) {
+                dmap_destroy(ret);
+                return NULL;
+            }
+            memcpy(atom->buffer, d->atoms[i].buffer, d->atoms[i].size);
+            ((char*)atom->buffer)[d->atoms[i].size] = '\0';
+        }
+        if (d->atoms[i].container != NULL) {
+            atom->container = dmap_copy(d->atoms[i].container);
+            if (atom->container == NULL) {
+                dmap_destroy(ret);
+                return NULL;
+            }
+        }
+        ret->count++;
+    }
+    return ret;
 }
 
 uint32_t dmap_tag_for_identifier(const char* identifier) {
-    
+    if (identifier == NULL)
+        return 0;
     for (uint32_t i = 0 ; i < _atom_type_count ; i++)
         if (strcmp(_atom_types[i].identifier, identifier) == 0)
             return _atom_types[i].tag;
-    
     if (strlen(identifier) >= 4) {
         uint32_t ret = 0;
         memcpy(&ret, identifier, sizeof(uint32_t));
         return ret;
     }
-    
     return 0;
-    
 }
 
 const char* dmap_identifier_for_tag(uint32_t tag) {
-    
     for (uint32_t i = 0 ; i < _atom_type_count ; i++)
         if (_atom_types[i].tag == tag)
             return _atom_types[i].identifier;
-    
     static char ret[sizeof(uint32_t) + 1];
     ret[sizeof(uint32_t)] = '\0';
-    
     memcpy(ret, (char*)&tag, sizeof(uint32_t));
-    
     return ret;
-    
 }
 
 uint32_t dmap_get_count(struct dmap_t* d) {
-    
-    return d->count;
-    
+    return d != NULL ? d->count : 0;
 }
 
 uint32_t dmap_get_tag_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count);
-    
+    if (d == NULL || index >= d->count)
+        return 0;
     return d->atoms[index].tag;
-    
 }
 
 uint32_t dmap_get_index_of_tag(struct dmap_t* d, uint32_t tag) {
-    
+    if (d == NULL)
+        return DMAP_INDEX_NOT_FOUND;
     for (uint32_t i = 0 ; i < d->count ; i++)
         if (d->atoms[i].tag == tag)
             return i;
-    
     return DMAP_INDEX_NOT_FOUND;
-    
 }
 
 size_t dmap_get_length(struct dmap_t* d) {
-    
+    if (d == NULL)
+        return 0;
     size_t ret = 0;
-    
     for (uint32_t i = 0 ; i < d->count ; i++) {
-        if (d->atoms[i].type == dmap_type_container)
+        if (d->atoms[i].type == dmap_type_container && d->atoms[i].container != NULL)
             ret += dmap_get_length(d->atoms[i].container) + 8;
         else
             ret += d->atoms[i].size + 8;
     }
-    
     return ret;
-    
 }
 
 size_t dmap_get_content(struct dmap_t* d, void* content, size_t size) {
-    
+    if (d == NULL || content == NULL)
+        return 0;
     size_t write_pos = 0;
-    
     for (uint32_t i = 0 ; i < d->count ; i++) {
-        
-        size_t atom_size = (d->atoms[i].type == dmap_type_container ? dmap_get_length(d->atoms[i].container) : d->atoms[i].size);
-        if (size - write_pos >= atom_size + 8) {
-            
-            uint32_t tag = mtbl(d->atoms[i].tag);
-            size_t a_size = mtbl(atom_size);
-            memcpy(&((char*)content)[write_pos], &tag, 4);
-            memcpy(&((char*)content)[write_pos + 4], &a_size, 4);
-            
-            write_pos += 8;
-            
-            if (d->atoms[i].size > 0 || d->atoms[i].type == dmap_type_container) {
-                
-                if (d->atoms[i].type == dmap_type_container)
-                    write_pos += dmap_get_content(d->atoms[i].container, &((char*)content)[write_pos], size - write_pos);
-                else {
-                    memcpy(&((char*)content)[write_pos], d->atoms[i].buffer, d->atoms[i].size);
-                    write_pos += d->atoms[i].size;
-                }
-                
-            }
-            
+        size_t atom_size = (d->atoms[i].type == dmap_type_container && d->atoms[i].container != NULL ? dmap_get_length(d->atoms[i].container) : d->atoms[i].size);
+        if (write_pos > size || atom_size > size - write_pos || atom_size + 8 > size - write_pos)
+            break;
+        uint32_t tag = mtbl(d->atoms[i].tag);
+        uint32_t a_size = mtbl((uint32_t)atom_size);
+        memcpy(&((char*)content)[write_pos], &tag, 4);
+        memcpy(&((char*)content)[write_pos + 4], &a_size, 4);
+        write_pos += 8;
+        if (d->atoms[i].type == dmap_type_container && d->atoms[i].container != NULL)
+            write_pos += dmap_get_content(d->atoms[i].container, &((char*)content)[write_pos], size - write_pos);
+        else if (d->atoms[i].size > 0 && d->atoms[i].buffer != NULL) {
+            memcpy(&((char*)content)[write_pos], d->atoms[i].buffer, d->atoms[i].size);
+            write_pos += d->atoms[i].size;
         }
-        
     }
-    
     return write_pos;
-    
 }
 
 size_t dmap_get_size_of_atom_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count);
-    
-    return d->atoms[index].size;
-    
+    return (d != NULL && index < d->count) ? d->atoms[index].size : 0;
 }
 
 size_t dmap_get_size_of_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_get_size_of_atom_at_index(d, index);
-    
-    return 0;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_get_size_of_atom_at_index(d, index) : 0;
 }
 
 size_t dmap_get_size_of_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_get_size_of_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 char dmap_char_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_char);
-    
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_char || d->atoms[index].size < 1 || d->atoms[index].buffer == NULL)
+        return 0;
     return *((char*)d->atoms[index].buffer);
-    
 }
 
 char dmap_char_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_char_at_index(d, index);
-    
-    return 0;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_char_at_index(d, index) : 0;
 }
 
 char dmap_char_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_char_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 int16_t dmap_short_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_short);
-    
-    return btms(*((int16_t*)d->atoms[index].buffer));
-    
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_short || d->atoms[index].size < 2 || d->atoms[index].buffer == NULL)
+        return 0;
+    int16_t value = 0;
+    memcpy(&value, d->atoms[index].buffer, sizeof(value));
+    return btms(value);
 }
 
 int16_t dmap_short_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_short_at_index(d, index);
-    
-    return 0;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_short_at_index(d, index) : 0;
 }
 
 int16_t dmap_short_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_short_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 int32_t dmap_long_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && (d->atoms[index].type == dmap_type_long || d->atoms[index].type == dmap_type_date));
-    
-    return btml(*((int32_t*)d->atoms[index].buffer));
-    
+    if (d == NULL || index >= d->count ||
+        (d->atoms[index].type != dmap_type_long && d->atoms[index].type != dmap_type_date) ||
+        d->atoms[index].size < 4 || d->atoms[index].buffer == NULL)
+        return 0;
+    int32_t value = 0;
+    memcpy(&value, d->atoms[index].buffer, sizeof(value));
+    return btml(value);
 }
 
 int32_t dmap_long_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_long_at_index(d, index);
-    
-    return 0;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_long_at_index(d, index) : 0;
 }
 
 int32_t dmap_long_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_long_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 int64_t dmap_longlong_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_longlong);
-    
-    return btmll(*((int64_t*)d->atoms[index].buffer));
-    
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_longlong || d->atoms[index].size < 8 || d->atoms[index].buffer == NULL)
+        return 0;
+    int64_t value = 0;
+    memcpy(&value, d->atoms[index].buffer, sizeof(value));
+    return btmll(value);
 }
 
 int64_t dmap_longlong_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_longlong_at_index(d, index);
-    
-    return 0;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_longlong_at_index(d, index) : 0;
 }
 
 int64_t dmap_longlong_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_longlong_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 const char* dmap_string_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_string);
-    
-    return (char*) d->atoms[index].buffer;
-    
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_string || d->atoms[index].buffer == NULL)
+        return NULL;
+    return (char*)d->atoms[index].buffer;
 }
 
 const char* dmap_string_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_string_at_index(d, index);
-    
-    return NULL;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_string_at_index(d, index) : NULL;
 }
 
 const char* dmap_string_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_string_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 uint32_t dmap_date_at_index(struct dmap_t* d, uint32_t index) {
-    
-    return dmap_long_at_index(d, index);
-    
+    return (uint32_t)dmap_long_at_index(d, index);
 }
 
 uint32_t dmap_date_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
-    return dmap_long_for_atom_tag(d, tag);
-    
+    return (uint32_t)dmap_long_for_atom_tag(d, tag);
 }
 
 uint32_t dmap_date_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
-    return dmap_long_for_atom_identifer(d, identifier);
-    
+    return (uint32_t)dmap_long_for_atom_identifer(d, identifier);
 }
 
 dmap_version dmap_version_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_version);
-    
-    dmap_version version = *((dmap_version*)d->atoms[index].buffer);
-    
+    dmap_version version = { 0, 0, 0 };
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_version || d->atoms[index].size < sizeof(dmap_version) || d->atoms[index].buffer == NULL)
+        return version;
+    memcpy(&version, d->atoms[index].buffer, sizeof(version));
     version.major = btms(version.major);
-    
     return version;
-    
 }
 
 dmap_version dmap_version_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_version_at_index(d, index);
-    
-    return (dmap_version){ 0, 0, 0 };
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_version_at_index(d, index) : (dmap_version){ 0, 0, 0 };
 }
 
 dmap_version dmap_version_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_version_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 struct dmap_t* dmap_container_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count && d->atoms[index].type == dmap_type_container);
-    
+    if (d == NULL || index >= d->count || d->atoms[index].type != dmap_type_container)
+        return NULL;
     return d->atoms[index].container;
-    
 }
 
 struct dmap_t* dmap_container_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return d->atoms[index].container;
-    
-    return NULL;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_container_at_index(d, index) : NULL;
 }
 
 struct dmap_t* dmap_container_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_container_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 const void* dmap_bytes_at_index(struct dmap_t* d, uint32_t index) {
-    
-    assert(index < d->count);
-    
-    return d->atoms[index].buffer;
-    
+    return (d != NULL && index < d->count) ? d->atoms[index].buffer : NULL;
 }
 
 const void* dmap_bytes_for_atom_tag(struct dmap_t* d, uint32_t tag) {
-    
     uint32_t index = dmap_get_index_of_tag(d, tag);
-    if (index != DMAP_INDEX_NOT_FOUND)
-        return dmap_bytes_at_index(d, index);
-    
-    return NULL;
-    
+    return index != DMAP_INDEX_NOT_FOUND ? dmap_bytes_at_index(d, index) : NULL;
 }
 
 const void* dmap_bytes_for_atom_identifer(struct dmap_t* d, const char* identifier) {
-    
     return dmap_bytes_for_atom_tag(d, dmap_tag_for_identifier(identifier));
-    
 }
 
 struct dmap_atom* _add_atom(struct dmap_t* d, uint32_t tag, uint32_t type) {
-    
-    d->atoms = (struct dmap_atom*)realloc(d->atoms, sizeof(struct dmap_atom) * (d->count + 1));
+    if (d == NULL)
+        return NULL;
+    struct dmap_atom* atoms = (struct dmap_atom*)realloc(d->atoms, sizeof(struct dmap_atom) * (d->count + 1));
+    if (atoms == NULL)
+        return NULL;
+    d->atoms = atoms;
     struct dmap_atom* ret = &d->atoms[d->count];
     d->count++;
     bzero(ret, sizeof(struct dmap_atom));
     ret->tag = tag;
     ret->type = type;
-    
     return ret;
-    
 }
 
-void _set_atom_buffer(struct dmap_atom* atom, const void* buffer, size_t size) {
-    
-    if (atom->buffer != NULL)
-        free(atom->buffer);
-    
+bool _set_atom_buffer(struct dmap_atom* atom, const void* buffer, size_t size) {
+    if (atom == NULL || (buffer == NULL && size > 0))
+        return false;
+    void* replacement = malloc(size + 1);
+    if (replacement == NULL)
+        return false;
+    bzero(replacement, size + 1);
+    if (size > 0)
+        memcpy(replacement, buffer, size);
+    free(atom->buffer);
+    atom->buffer = replacement;
     atom->size = size;
-    atom->buffer = malloc(size + 1);
-    bzero(atom->buffer, size + 1);
-    memcpy(atom->buffer, buffer, size);
-    
+    return true;
 }
+
 void dmap_add_char(struct dmap_t* d, int8_t chr, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_char);
     _set_atom_buffer(new_atom, &chr, sizeof(int8_t));
-    
 }
 
 void dmap_add_short(struct dmap_t* d, int16_t shrt, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_short);
     int16_t val = mtbs(shrt);
     _set_atom_buffer(new_atom, &val, sizeof(int16_t));
-    
 }
 
 void dmap_add_long(struct dmap_t* d, int32_t lng, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_long);
     int32_t val = mtbl(lng);
     _set_atom_buffer(new_atom, &val, sizeof(int32_t));
-    
 }
 
 void dmap_add_longlong(struct dmap_t* d, int64_t lnglng, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_longlong);
     int64_t val = mtbll(lnglng);
     _set_atom_buffer(new_atom, &val, sizeof(int64_t));
-    
 }
 
 void dmap_add_string(struct dmap_t* d, const char* string, uint32_t tag) {
-    
+    if (string == NULL)
+        return;
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_string);
     _set_atom_buffer(new_atom, string, strlen(string));
-    
 }
 
 void dmap_add_date(struct dmap_t* d, uint32_t date, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_date);
     uint32_t val = mtbl(date);
     _set_atom_buffer(new_atom, &val, sizeof(uint32_t));
-    
 }
 
 void dmap_add_version(struct dmap_t* d, dmap_version version, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_version);
-    
     dmap_version val = version;
     val.major = mtbs(val.major);
-    
-    _set_atom_buffer(new_atom, &val, sizeof(uint32_t));
-    
+    _set_atom_buffer(new_atom, &val, sizeof(dmap_version));
 }
 
 void dmap_add_container(struct dmap_t* d, struct dmap_t* container, uint32_t tag) {
-    
+    if (container == NULL)
+        return;
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_container);
-    new_atom->container = dmap_copy(container);
-    
+    if (new_atom != NULL)
+        new_atom->container = dmap_copy(container);
 }
 
 void dmap_add_bytes(struct dmap_t* d, const void* data, size_t size, uint32_t tag) {
-    
     struct dmap_atom* new_atom = _add_atom(d, tag, dmap_type_unknown);
     _set_atom_buffer(new_atom, data, size);
-    
 }
