@@ -80,7 +80,8 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
                         new_parameter.value++;
                     if (new_parameter.value[0] == '\"') {
                         new_parameter.value++;
-                        new_parameter.key[line_length - 1] = '\0';
+                        if (line_length > 0)
+                            new_parameter.key[line_length - 1] = '\0';
                     }
                 }
                 
@@ -88,10 +89,13 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
                 p->parameters[p->parameters_count] = new_parameter;
                 p->parameters_count++;
                 
-                line_start += line_length + delimiter_length;
-                
-                if (line_start[0] == ' ')
-                    line_start++;
+                /* There is no next field after the synthetic end-of-buffer
+                   delimiter. Do not advance line_start beyond the input. */
+                if (i < data_size) {
+                    line_start += line_length + delimiter_length;
+                    if (line_start < buffer + data_size && line_start[0] == ' ')
+                        line_start++;
+                }
                 
             }
             
@@ -106,19 +110,24 @@ void _parameters_parse_http_authentication(struct parameters_t* p, const void* b
     _parameters_parse(p, buffer, size, ",", "=");
     
     for (uint32_t i = 0 ; i < p->parameters_count ; i++) {
-                
-        if (p->parameters[i].value[0] == '"' || p->parameters[i].value[0] == '\'') {
-            
-            p->parameters[i].value++;
-            p->parameters[i].value[strlen(p->parameters[i].value) - 1] = '\0';
-            
+        
+        if (p->parameters[i].value == NULL)
+            continue;
+        
+        size_t value_len = strlen(p->parameters[i].value);
+        if (value_len >= 2 && (p->parameters[i].value[0] == '"' || p->parameters[i].value[0] == '\'')) {
+            char quote = p->parameters[i].value[0];
+            if (p->parameters[i].value[value_len - 1] == quote) {
+                p->parameters[i].value++;
+                p->parameters[i].value[value_len - 2] = '\0';
+            }
         }
         
         size_t key_len = strlen(p->parameters[i].key);
         size_t total_len = key_len + strlen(p->parameters[i].value);
         
         char tmp_buf[total_len + 2];
-        if (p->parameters[i].key[0] == ' ') {
+        if (key_len > 0 && p->parameters[i].key[0] == ' ') {
             total_len--; key_len--;
             memcpy(tmp_buf, &p->parameters[i].key[1], key_len);
         } else
@@ -139,7 +148,8 @@ void _parameters_parse_http_authentication(struct parameters_t* p, const void* b
 size_t _parameters_write_http_header(struct parameters_t* p, void* buffer, size_t buffer_size) {
     
     size_t write_pos = 0;
-    bzero(buffer, buffer_size);
+    if (buffer != NULL && buffer_size > 0)
+        bzero(buffer, buffer_size);
     char* c_buffer = (char*)buffer;
     
     for (uint32_t i = 0 ; i < p->parameters_count ; i++) {
@@ -162,7 +172,7 @@ size_t _parameters_write_http_header(struct parameters_t* p, void* buffer, size_
         }
     }
     
-    if (buffer != NULL)
+    if (buffer != NULL && write_pos < buffer_size)
         c_buffer[write_pos] = '\0';
     
     return write_pos + 1;
@@ -185,7 +195,7 @@ struct parameters_t* parameters_create(const void* buffer, size_t size, enum par
             
             for (uint32_t i = 0 ; i < p->parameters_count ; i++) {
                 struct parameter_t* param = &p->parameters[i];
-                if (strcmp(param->key, "a") == 0) {
+                if (param->value != NULL && strcmp(param->key, "a") == 0) {
                     char* colon = strchr(param->value, ':');
                     if (colon != NULL) {
                         param->key[1] = '-';
@@ -210,6 +220,9 @@ struct parameters_t* parameters_create(const void* buffer, size_t size, enum par
 
 void parameters_destroy(struct parameters_t* p) {
     
+    if (p == NULL)
+        return;
+    
     for (uint32_t i = 0 ; i < p->parameters_count ; i++)
         free(p->parameters[i].key);
     
@@ -221,19 +234,22 @@ void parameters_destroy(struct parameters_t* p) {
 
 uint32_t parameters_get_count(struct parameters_t* p) {
     
-    return p->parameters_count;
+    return p != NULL ? p->parameters_count : 0;
     
 }
 
 const char* parameters_key_at_index(struct parameters_t* p, uint32_t index) {
     
-    assert(index < p->parameters_count);
+    assert(p != NULL && index < p->parameters_count);
     
     return p->parameters[index].key;
     
 }
 
 const char* parameters_value_for_key(struct parameters_t* p, const char* key) {
+    
+    if (p == NULL || key == NULL)
+        return NULL;
     
     for (uint32_t i = 0 ; i < p->parameters_count ; i++)
         if (0 == strcmp(p->parameters[i].key, key))
@@ -245,7 +261,7 @@ const char* parameters_value_for_key(struct parameters_t* p, const char* key) {
 
 void parameters_set_value(struct parameters_t* p, const char* key, const char* value, ...) {
     
-    assert(key != NULL && value != NULL);
+    assert(p != NULL && key != NULL && value != NULL);
     
     char new_value[100];
     bzero(new_value, 100);
@@ -282,8 +298,12 @@ void parameters_set_value(struct parameters_t* p, const char* key, const char* v
 
 void parameters_remove_key(struct parameters_t* p, const char* key) {
     
+    if (p == NULL || key == NULL)
+        return;
+    
     for (uint32_t i = 0 ; i < p->parameters_count ; i++)
         if (0 == strcmp(p->parameters[i].key, key)) {
+            free(p->parameters[i].key);
             for (uint32_t x = i ; x < p->parameters_count - 1 ; x++)
                 p->parameters[x] = p->parameters[x + 1];
             p->parameters_count--;
@@ -293,6 +313,9 @@ void parameters_remove_key(struct parameters_t* p, const char* key) {
 }
 
 size_t parameters_write(struct parameters_t* p, void* buffer, size_t buffer_size, enum parameters_type type) {
+    
+    if (p == NULL)
+        return 0;
     
     switch (type) {
         case parameters_type_http_header:
