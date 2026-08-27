@@ -50,7 +50,7 @@ size_t base64_encode(const void *data, size_t size, char **str) {
         return (size_t)-1;
     
     char *s, *p;
-    int i;
+    size_t i;
     int c;
     const unsigned char *q;
     
