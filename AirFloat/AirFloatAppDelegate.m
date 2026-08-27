@@ -43,13 +43,11 @@
     NSDictionary *_settings;
 }
 
-
 #pragma mark - NSApplication delegates
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     
     self.appViewController = [[[AppViewController alloc] init] autorelease];
-    
     self.window = [[[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds] autorelease];
     
     if ([self.window respondsToSelector:@selector(setRootViewController:)])
@@ -64,6 +62,11 @@
     if ([UIApplication instancesRespondToSelector:@selector(registerUserNotificationSettings:)]){
         [application registerUserNotificationSettings:[UIUserNotificationSettings settingsForTypes:UIUserNotificationTypeAlert|UIUserNotificationTypeBadge|UIUserNotificationTypeSound categories:nil]];
     }
+    
+    /* Load persisted settings before applicationDidBecomeActive starts the
+       RAOP server. The previous code read the backing ivar directly and could
+       silently start with default/empty values on a cold launch. */
+    [self getSettings];
     
     audio_output_session_start();
     
@@ -91,8 +94,11 @@
 
 - (void)applicationWillTerminate:(UIApplication *)application
 {
+    if (self.server != NULL) {
+        raop_server_destroy(self.server);
+        self.server = NULL;
+    }
 }
-
 
 #pragma mark - Application Settings
 
@@ -110,11 +116,11 @@
     
     if (!_settings) {
         _settings = [[NSDictionary alloc] initWithContentsOfFile:[self settingsPath]];
-        _settings = (_settings ?: [[NSDictionary alloc] init]);
+        if (!_settings)
+            _settings = [[NSDictionary alloc] init];
     }
     
     return _settings;
-    
 }
 
 - (void)setSettings:(NSDictionary *)settings {
@@ -123,45 +129,61 @@
     
     [_settings release];
     _settings = [settings copy];
+    if (!_settings)
+        _settings = [[NSDictionary alloc] init];
     
-    [_settings writeToFile:[self settingsPath]
-                atomically:YES];
+    [_settings writeToFile:[self settingsPath] atomically:YES];
     
     if (self.server) {
-        
+        NSString* name = [_settings objectForKey:@"name"];
         NSString* password = [_settings objectForKey:@"password"];
+        BOOL authenticationEnabled = [[_settings objectForKey:@"authenticationEnabled"] boolValue];
         
-        raop_server_set_settings(self.server, (struct raop_server_settings_t) { [[_settings objectForKey:@"name"] cStringUsingEncoding:NSASCIIStringEncoding], ([[_settings objectForKey:@"authenticationEnabled"] boolValue] && password && [password length] > 0 ? [[_settings objectForKey:@"password"] cStringUsingEncoding:NSUTF8StringEncoding] : NULL) });
-        
+        raop_server_set_settings(self.server, (struct raop_server_settings_t) {
+            [name cStringUsingEncoding:NSUTF8StringEncoding],
+            (authenticationEnabled && password && [password length] > 0 ? [password cStringUsingEncoding:NSUTF8StringEncoding] : NULL)
+        });
     }
     
     [self didChangeValueForKey:@"settings"];
-    
 }
-
 
 #pragma mark - RAOP Server interface
 
 - (void)startRaopServer  {
     
+    NSDictionary* settingsDictionary = [self getSettings];
+    
     if (!self.server) {
+        NSString* name = [settingsDictionary objectForKey:@"name"];
+        NSString* password = [settingsDictionary objectForKey:@"password"];
+        BOOL authenticationEnabled = [[settingsDictionary objectForKey:@"authenticationEnabled"] boolValue];
+        
         struct raop_server_settings_t settings;
-        settings.name = [[_settings objectForKey:@"name"] cStringUsingEncoding:NSUTF8StringEncoding];
-        settings.password = ([[_settings objectForKey:@"authenticationEnabled"] boolValue] ? [[_settings objectForKey:@"password"] cStringUsingEncoding:NSUTF8StringEncoding] : NULL);
+        settings.name = [name cStringUsingEncoding:NSUTF8StringEncoding];
+        settings.password = (authenticationEnabled && password && [password length] > 0 ? [password cStringUsingEncoding:NSUTF8StringEncoding] : NULL);
         self.server = raop_server_create(settings);
+        
+        if (!self.server) {
+            NSLog(@"Unable to create RAOP server");
+            return;
+        }
     }
     
     if (!raop_server_is_running(self.server)) {
-        
         uint16_t port = 5000;
-        while (port < 5010 && !raop_server_start(_server, port++));
+        BOOL started = NO;
+        while (port < 5010 && !(started = raop_server_start(self.server, port)))
+            port++;
         
-        self.appViewController.server = _server;
+        if (!started) {
+            NSLog(@"Unable to start RAOP server");
+            return;
+        }
         
+        self.appViewController.server = self.server;
     }
-    
 }
-
 
 #pragma mark - Background Notifications
 
@@ -177,6 +199,7 @@
     notification.soundName = UILocalNotificationDefaultSoundName;
     
     [[UIApplication sharedApplication] scheduleLocalNotification:notification];
+    [notification release];
 }
 
 @end
