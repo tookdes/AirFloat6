@@ -71,6 +71,14 @@ struct thread_t* thread_create_a(thread_start_fnc start_fnc, void* ctx) {
 
 void thread_destroy(struct thread_t* t) {
     
+    if (t->thread != NULL && pthread_equal(pthread_self(), *t->thread)) {
+        pthread_detach(*t->thread);
+        free(t->thread);
+        t->thread = NULL;
+        free(t);
+        return;
+    }
+    
     thread_join(t);
     
     free(t);
