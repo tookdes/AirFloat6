@@ -757,7 +757,7 @@ struct audio_queue_missing_packet_window audio_queue_get_next_missing_window(str
                 
                 ret.seq_no = current_packet->seq_no;
                 
-                for (struct audio_packet_t* missing_packet = current_packet ; missing_packet->state == audio_packet_state_missing ; missing_packet = missing_packet->next) {
+                for (struct audio_packet_t* missing_packet = current_packet ; missing_packet != NULL && missing_packet->state == audio_packet_state_missing ; missing_packet = missing_packet->next) {
                     ret.packet_count++;
                     missing_packet->state = audio_packet_state_requested;
                 }
