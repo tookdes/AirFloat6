@@ -74,10 +74,22 @@ bool _raop_server_web_connection_accept_callback(web_server_p server, web_server
     if (!sockaddr_equals_host(web_server_connection_get_local_end_point(connection), web_server_connection_get_remote_end_point(connection))) {
 #endif
         raop_session_p new_session = raop_session_create(rs, connection, rs->settings);
+        if (new_session == NULL) {
+            log_message(LOG_ERROR, "Unable to create RAOP session");
+            return false;
+        }
         
         mutex_lock(rs->mutex);
         
-        rs->sessions = (raop_session_p*)realloc(rs->sessions, sizeof(raop_session_p) * (rs->sessions_count + 1));
+        raop_session_p* sessions = (raop_session_p*)realloc(rs->sessions, sizeof(raop_session_p) * (rs->sessions_count + 1));
+        if (sessions == NULL) {
+            mutex_unlock(rs->mutex);
+            raop_session_destroy(new_session);
+            log_message(LOG_ERROR, "Unable to store RAOP session");
+            return false;
+        }
+        
+        rs->sessions = sessions;
         rs->sessions[rs->sessions_count] = new_session;
         rs->sessions_count++;
         
