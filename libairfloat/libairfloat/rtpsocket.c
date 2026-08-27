@@ -181,13 +181,14 @@ void rtp_socket_destroy(struct rtp_socket_t* rs) {
     rs->received_callback_ctx = NULL;
     mutex_unlock(rs->mutex);
     
-    /* Detach callbacks before destroying the sockets. socket_destroy waits
-       for their workers, so no callback can reference rs after this loop. */
+    /* Detach close callbacks before destroying the sockets. Receive workers
+       may still enter the RTP receive callback while socket_destroy joins
+       them, but destroying=true makes that callback return without touching
+       user state, and rs stays alive until all workers have exited. */
     for (uint32_t i = 0 ; i < sockets_count ; i++) {
         if (sockets[i] != NULL) {
             if (sockets[i]->socket != NULL) {
                 socket_set_closed_callback(sockets[i]->socket, NULL, NULL);
-                socket_set_receive_callback(sockets[i]->socket, NULL, NULL);
                 socket_destroy(sockets[i]->socket);
             }
             free(sockets[i]);
