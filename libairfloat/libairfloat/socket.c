@@ -51,6 +51,8 @@ struct socket_t {
     bool close_in_progress;
     bool destroy_pending;
     bool destroying;
+    bool accept_loop_active;
+    bool receive_loop_active;
     mutex_p mutex;
     thread_p accept_thread;
     thread_p receive_thread;
@@ -85,6 +87,29 @@ void _socket_set_loop_name(struct socket_t* s, const char* name) {
     
 }
 
+void _socket_worker_finished(struct socket_t* s, bool accept_worker) {
+    
+    bool should_destroy = false;
+    
+    mutex_lock(s->mutex);
+    
+    if (accept_worker)
+        s->accept_loop_active = false;
+    else
+        s->receive_loop_active = false;
+    
+    should_destroy = s->destroy_pending && !s->close_in_progress && !s->destroying &&
+                     !s->accept_loop_active && !s->receive_loop_active;
+    if (should_destroy)
+        s->destroy_pending = false;
+    
+    mutex_unlock(s->mutex);
+    
+    if (should_destroy)
+        socket_destroy(s);
+    
+}
+
 void _socket_accept_loop(void* ctx) {
     
     struct socket_t* s = (struct socket_t*)ctx;
@@ -92,6 +117,7 @@ void _socket_accept_loop(void* ctx) {
     mutex_lock(s->mutex);
     _socket_set_loop_name(s, "Accept Loop");
     
+    s->accept_loop_active = true;
     s->is_connected = true;
     
     int new_socket_fd = 0;
@@ -128,6 +154,7 @@ void _socket_accept_loop(void* ctx) {
     mutex_unlock(s->mutex);
     
     socket_close(s);
+    _socket_worker_finished(s, true);
     
 }
 
@@ -138,6 +165,7 @@ void _socket_receive_loop(void* ctx) {
     mutex_lock(s->mutex);
     _socket_set_loop_name(s, "Receive Loop");
     
+    s->receive_loop_active = true;
     s->is_connected = true;
     
     void* buffer = NULL;
@@ -203,6 +231,7 @@ void _socket_receive_loop(void* ctx) {
     mutex_unlock(s->mutex);
     
     socket_close(s);
+    _socket_worker_finished(s, false);
     
 }
 
@@ -248,6 +277,9 @@ struct socket_t* socket_create(const char* name, bool is_udp) {
 
 void socket_destroy(struct socket_t* s) {
     
+    if (s == NULL)
+        return;
+    
     mutex_lock(s->mutex);
     
     if (s->destroying) {
@@ -258,6 +290,13 @@ void socket_destroy(struct socket_t* s) {
     if (s->close_in_progress) {
         s->destroy_pending = true;
         mutex_unlock(s->mutex);
+        return;
+    }
+    
+    if (s->accept_loop_active || s->receive_loop_active) {
+        s->destroy_pending = true;
+        mutex_unlock(s->mutex);
+        socket_close(s);
         return;
     }
     
@@ -500,8 +539,10 @@ void socket_close(struct socket_t* s) {
     mutex_lock(s->mutex);
     
     s->close_in_progress = false;
-    bool should_destroy = s->destroy_pending && !s->destroying;
-    s->destroy_pending = false;
+    bool should_destroy = s->destroy_pending && !s->destroying &&
+                          !s->accept_loop_active && !s->receive_loop_active;
+    if (should_destroy)
+        s->destroy_pending = false;
     
     mutex_unlock(s->mutex);
     
@@ -565,6 +606,10 @@ bool socket_is_udp(struct socket_t* s) {
 
 bool socket_is_connected(struct socket_t* s) {
     
-    return s->is_connected;
+    mutex_lock(s->mutex);
+    bool ret = s->is_connected;
+    mutex_unlock(s->mutex);
+    
+    return ret;
     
 }
