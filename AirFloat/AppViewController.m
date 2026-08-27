@@ -71,6 +71,7 @@
 - (void)setDacpClient:(NSValue*)pointer;
 - (void)updatePlaybackState;
 - (void)updateControlsAvailability;
+- (void)startDelayedBackgroundTask;
 
 @end
 
@@ -79,8 +80,8 @@ static int backgroundTaskTimeLimit = 0;
 static int backgroundTaskCount = 0;
 static BOOL clientIsStreaming = false;
 
-UIBackgroundTaskIdentifier backgroundTask = 0;
-UIBackgroundTaskIdentifier helperBackgroundTask = 0;
+UIBackgroundTaskIdentifier backgroundTask = UIBackgroundTaskInvalid;
+UIBackgroundTaskIdentifier helperBackgroundTask = UIBackgroundTaskInvalid;
 
 void dacpClientControlsBecameAvailable(dacp_client_p client, void* ctx) {
     
@@ -137,7 +138,26 @@ void clientEndedRecording(raop_session_p raop_session, void* ctx) {
     AppViewController* viewController = (AppViewController*)ctx;
 
     if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
-        backgroundTask = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIApplication* application = [UIApplication sharedApplication];
+            
+            if (backgroundTask != UIBackgroundTaskInvalid) {
+                UIBackgroundTaskIdentifier oldTask = backgroundTask;
+                backgroundTask = UIBackgroundTaskInvalid;
+                [application endBackgroundTask:oldTask];
+            }
+            
+            __block UIBackgroundTaskIdentifier newTask = UIBackgroundTaskInvalid;
+            newTask = [application beginBackgroundTaskWithExpirationHandler:^{
+                UIBackgroundTaskIdentifier expiredTask = newTask;
+                newTask = UIBackgroundTaskInvalid;
+                if (backgroundTask == expiredTask)
+                    backgroundTask = UIBackgroundTaskInvalid;
+                if (expiredTask != UIBackgroundTaskInvalid)
+                    [application endBackgroundTask:expiredTask];
+            }];
+            backgroundTask = newTask;
+        });
     }
 
     [viewController performSelectorOnMainThread:@selector(clientEndedRecording) withObject:nil waitUntilDone:NO];
@@ -356,7 +376,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
 - (UIStatusBarStyle)preferredStatusBarStyle {
     
     return UIStatusBarStyleLightContent;
-    
 }
 
 - (void)displayViewControllerAsOverlay:(UIViewController*)viewController {
@@ -500,7 +519,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
 - (BOOL)canBecomeFirstResponder {
     
     return YES;
-    
 }
 
 - (void)clientStartedRecording {
@@ -540,7 +558,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     [self updateControlsAvailability];
     
     [self updateScreenIdleState];
-    
 }
 
 - (void)clientEndedRecording {
@@ -584,25 +601,24 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     [self updateNowPlayingInfoCenter];
     
     [self updateScreenIdleState];
-    
 }
 
 - (void)stopBackgroundTask {
     
     NSLog(@"stopBackgroundTask called");
-    UIBackgroundTaskIdentifier identifier = backgroundTask;
-    backgroundTask = 0;
-    [[UIApplication sharedApplication] endBackgroundTask:identifier];
-    
+    if (backgroundTask != UIBackgroundTaskInvalid) {
+        UIBackgroundTaskIdentifier identifier = backgroundTask;
+        backgroundTask = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:identifier];
+    }
 }
 
 - (void)clientEnded {
     
-//    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground && backgroundTask > 0) {
+//    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground && backgroundTask != UIBackgroundTaskInvalid) {
 //        raop_server_stop(self.server);
 //        [self performSelector:@selector(stopBackgroundTask) withObject:nil afterDelay:1.0];
 //    }
-    
 }
 
 - (void)setAndScaleImage:(UIImage *)image {
@@ -614,7 +630,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
         CGSize screenSize = [UIScreen mainScreen].bounds.size;
         size = CGSizeMake(MAX(screenSize.width, screenSize.height),
                           MAX(screenSize.width, screenSize.height));
-        
     }
     
     UIImage* actualImage = [image imageAspectedFilledWithSize:size];
@@ -622,7 +637,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     
     [self.artworkImageView performSelectorOnMainThread:@selector(setImage:) withObject:actualImage waitUntilDone:NO];
     [self.blurredArtworkImageView performSelectorOnMainThread:@selector(setImage:) withObject:blurredImage waitUntilDone:NO];
-    
 }
 
 - (void)clientUpdatedArtwork:(UIImage *)image {
@@ -633,7 +647,6 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     _artworkImage = [image retain];
     
     [self updateNowPlayingInfoCenter];
-    
 }
 
 - (void)clientUpdatedTrackInfo:(NSString *)trackTitle artistName:(NSString *)artistName andAlbumTitle:(NSString *)albumTitle {
@@ -645,13 +658,11 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     _albumTitle = albumTitle;
     
     [self updateNowPlayingInfoCenter];
-    
 }
 
 - (void)setDacpClient:(NSValue*)pointer {
     
     _dacp_client = (dacp_client_p)[pointer pointerValue];
-    
 }
 
 - (void)updatePlaybackState {
@@ -662,9 +673,7 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
         
         [self.playButton setImage:[UIImage imageNamed:(playing ? @"Pause.png" : @"Play.png")]
                          forState:UIControlStateNormal];
-        
     }
-    
 }
 
 - (void)updateControlsAvailability {
@@ -692,19 +701,16 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
                          
                          for (UIButton* button in self.controlButtons)
                              button.hidden = !isAvailable;
-                         
                      }];
     
     if (isAvailable)
         dacp_client_update_playback_state(_dacp_client);
-    
 }
 
 - (IBAction)playNext:(id)sender {
     
     if (_dacp_client != NULL)
         dacp_client_next(_dacp_client);
-    
 }
 
 - (IBAction)playPause:(id)sender {
@@ -713,14 +719,12 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
         dacp_client_toggle_playback(_dacp_client);
         dacp_client_update_playback_state(_dacp_client);
     }
-    
 }
 
 - (IBAction)playPrevious:(id)sender {
     
     if (_dacp_client != NULL)
         dacp_client_previous(_dacp_client);
-    
 }
 
 - (void)remoteControlReceivedWithEvent:(UIEvent *)event {
@@ -742,19 +746,16 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
             default:
                 break;
         }
-    
 }
 
 - (BOOL)shouldAutorotate {
     
     return ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad);
-    
 }
 
 - (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)toInterfaceOrientation {
     
     return ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad || toInterfaceOrientation == UIDeviceOrientationPortrait);
-    
 }
 
 - (void)updateScreenIdleState {
@@ -766,13 +767,11 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     disabled &= (![[[AirFloatSharedAppDelegate getSettings] objectForKey:@"keepScreenLitOnlyWhenConnectedToPower"] boolValue] || ([UIDevice currentDevice].batteryState == UIDeviceBatteryStateCharging || [UIDevice currentDevice].batteryState == UIDeviceBatteryStateFull));
     
     [UIApplication sharedApplication].idleTimerDisabled = disabled;
-    
 }
 
 - (void)settingsUpdated:(NSNotification *)notification {
     
     [self updateScreenIdleState];
-    
 }
 
 - (void)batteryStateChanged:(NSNotification *)notification {
@@ -785,9 +784,14 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
 
 dispatch_block_t helperBackgroundTaskBlock = ^{
     [[NSThread currentThread] setName:@"helperBackgroundTaskBlock.init"];
-    [[UIApplication sharedApplication] endBackgroundTask:helperBackgroundTask];
+    UIApplication* application = [UIApplication sharedApplication];
+    UIBackgroundTaskIdentifier expiredTask = helperBackgroundTask;
     helperBackgroundTask = UIBackgroundTaskInvalid;
-    helperBackgroundTask = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:helperBackgroundTaskBlock];
+    if (expiredTask != UIBackgroundTaskInvalid)
+        [application endBackgroundTask:expiredTask];
+    
+    if (application.applicationState == UIApplicationStateBackground)
+        helperBackgroundTask = [application beginBackgroundTaskWithExpirationHandler:helperBackgroundTaskBlock];
 };
 
 
@@ -807,35 +811,29 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
     if ([device respondsToSelector:@selector(isMultitaskingSupported)]) {
         backgroundSupported = device.multitaskingSupported;
     }
-    if (backgroundSupported) { // perform a background task
-        
+    if (backgroundSupported) {
         [self setBackgroundTaskTimeLimit];
         [self doBackgroundTaskAsync:@selector(keepAlive)];
-        [self performSelector:@selector(doBackgroundTaskAsync:) withObject:nil afterDelay:[self getBackgroundTaskStartupDelay]];
-
+        [self performSelector:@selector(startDelayedBackgroundTask) withObject:nil afterDelay:[self getBackgroundTaskStartupDelay]];
     }
 }
 
 -(void)setBackgroundTaskTimeLimit {
     [self startHelperBackgroundTask];
     
-    // Wait for background async task by 'OhadM':
-    // http://stackoverflow.com/a/31893720
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         @autoreleasepool {
-            
             [[NSThread currentThread] setName:@"setBackgroundTaskTimeLimit.dispatch_async"];
-            backgroundTaskTimeLimit = [[UIApplication sharedApplication ] backgroundTimeRemaining];
+            backgroundTaskTimeLimit = (int)[[UIApplication sharedApplication] backgroundTimeRemaining];
             NSLog(@"setBackgroundTaskTimeLimit to: %i", backgroundTaskTimeLimit);
-            
         }
         dispatch_semaphore_signal(semaphore);
-        dispatch_release(semaphore);
     });
     
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    dispatch_release(semaphore);
     [self stopHelperBackgroundTask];
 }
 
@@ -843,12 +841,17 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
     NSLog(@"stopHelperBackgroundTask called");
     helperBackgroundTaskBlock = ^{
         [[NSThread currentThread] setName:@"helperBackgroundTaskBlock.stopped"];
-        [[UIApplication sharedApplication] endBackgroundTask:helperBackgroundTask];
+        UIApplication* application = [UIApplication sharedApplication];
+        UIBackgroundTaskIdentifier expiredTask = helperBackgroundTask;
         helperBackgroundTask = UIBackgroundTaskInvalid;
+        if (expiredTask != UIBackgroundTaskInvalid)
+            [application endBackgroundTask:expiredTask];
     };
-    if (helperBackgroundTask) {
-        [[UIApplication sharedApplication] endBackgroundTask:helperBackgroundTask];
+    
+    if (helperBackgroundTask != UIBackgroundTaskInvalid) {
+        UIBackgroundTaskIdentifier identifier = helperBackgroundTask;
         helperBackgroundTask = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:identifier];
     }
 }
 
@@ -857,10 +860,20 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
     if (!helperBackgroundTaskBlock) {
         helperBackgroundTaskBlock = ^{
             [[NSThread currentThread] setName:@"helperBackgroundTaskBlock.started"];
-            [[UIApplication sharedApplication] endBackgroundTask:helperBackgroundTask];
+            UIApplication* application = [UIApplication sharedApplication];
+            UIBackgroundTaskIdentifier expiredTask = helperBackgroundTask;
             helperBackgroundTask = UIBackgroundTaskInvalid;
+            if (expiredTask != UIBackgroundTaskInvalid)
+                [application endBackgroundTask:expiredTask];
         };
     }
+    
+    if (helperBackgroundTask != UIBackgroundTaskInvalid) {
+        UIBackgroundTaskIdentifier identifier = helperBackgroundTask;
+        helperBackgroundTask = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:identifier];
+    }
+    
     helperBackgroundTask = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:helperBackgroundTaskBlock];
 }
 
@@ -881,11 +894,17 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
     return startupDelay;
 }
 
+-(void)startDelayedBackgroundTask {
+    [self doBackgroundTaskAsync:@selector(keepAlive)];
+}
+
 -(void)doBackgroundTaskAsync:(SEL)selector {
     
     NSLog(@"doBackgroundTaskAsync called");
     if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateBackground
-       || [self getBackgroundTaskCount] >= MAXIMUM_BACKGROUND_TASKS) {
+       || [self getBackgroundTaskCount] >= MAXIMUM_BACKGROUND_TASKS
+       || selector == NULL
+       || ![self respondsToSelector:selector]) {
         NSLog(@"doBackgroundTaskAsync denied start");
         return;
     }
@@ -894,13 +913,15 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
     
     [self incrementBackgroundTaskCount];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        [[NSThread currentThread] setName:@"doBackgroundTaskAsync.dispatch_async"];
-        while ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) {
-            NSLog(@"doBackgroundTaskAsync in while loop. TR: %f",  [[UIApplication sharedApplication] backgroundTimeRemaining]);
-            [self performSelector: @selector(keepAlive)];
-            sleep(5.0);
+        @autoreleasepool {
+            [[NSThread currentThread] setName:@"doBackgroundTaskAsync.dispatch_async"];
+            while ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) {
+                NSLog(@"doBackgroundTaskAsync in while loop. TR: %f", [[UIApplication sharedApplication] backgroundTimeRemaining]);
+                [self performSelector:selector];
+                sleep(5.0);
+            }
+            NSLog(@"doBackgroundTaskAsync task ended");
         }
-        NSLog(@"doBackgroundTaskAsync task ended");
     });
 }
 
