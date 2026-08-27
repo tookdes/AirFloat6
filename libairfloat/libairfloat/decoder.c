@@ -31,7 +31,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <assert.h>
 
 #include "mutex.h"
 #include "decoder_alac.h"
@@ -49,66 +48,103 @@ struct decoder_t {
 
 struct decoder_t* decoder_create(const char* type, const char* rtp_fmtp) {
     
-    assert(type);
-
-    struct decoder_t* d = (struct decoder_t*)malloc(sizeof(struct decoder_t));
-    bzero(d, sizeof(struct decoder_t));
+    if (type == NULL || rtp_fmtp == NULL)
+        return NULL;
     
-    d->mutex = mutex_create();
+    enum decoder_type decoder_type = decoder_type_unknown;
+    void* decoder_data = NULL;
     
     if (strcmp(type, "AppleLossless") == 0) {
-        
-        d->type = decoder_type_alac;
-        d->data = decoder_alac_create(rtp_fmtp);
-        
+        decoder_type = decoder_type_alac;
+        decoder_data = decoder_alac_create(rtp_fmtp);
+    } else
+        return NULL;
+    
+    if (decoder_data == NULL)
+        return NULL;
+    
+    struct decoder_t* d = (struct decoder_t*)malloc(sizeof(struct decoder_t));
+    if (d == NULL) {
+        if (decoder_type == decoder_type_alac)
+            decoder_alac_destroy(decoder_data);
+        return NULL;
+    }
+    bzero(d, sizeof(struct decoder_t));
+    
+    d->type = decoder_type;
+    d->data = decoder_data;
+    d->mutex = mutex_create();
+    if (d->mutex == NULL) {
+        if (d->type == decoder_type_alac)
+            decoder_alac_destroy(d->data);
+        free(d);
+        return NULL;
+    }
+    
+    struct decoder_output_format_t output_format = decoder_get_output_format(d);
+    if (output_format.frame_size == 0 || output_format.frames_per_packet == 0 ||
+        output_format.sample_rate == 0 || output_format.channels == 0 || output_format.bit_depth == 0) {
+        decoder_destroy(d);
+        return NULL;
     }
     
     return d;
-    
 }
 
 void decoder_destroy(struct decoder_t* d) {
     
-    if (d->type == decoder_type_alac)
-        decoder_alac_destroy(d->data);
+    if (d == NULL)
+        return;
+    
+    mutex_lock(d->mutex);
+    enum decoder_type type = d->type;
+    void* data = d->data;
+    d->type = decoder_type_unknown;
+    d->data = NULL;
+    mutex_unlock(d->mutex);
+    
+    if (type == decoder_type_alac && data != NULL)
+        decoder_alac_destroy(data);
     
     mutex_destroy(d->mutex);
-    
     free(d);
-    
 }
 
 struct decoder_output_format_t decoder_get_output_format(decoder_p d) {
     
-    if (d->type == decoder_type_alac)
-        return decoder_alac_get_output_format(d->data);
+    if (d == NULL)
+        return (struct decoder_output_format_t){ 0, 0, 0, 0 };
     
-    return (struct decoder_output_format_t){0,0,0,0};
+    mutex_lock(d->mutex);
+    struct decoder_output_format_t ret = { 0, 0, 0, 0 };
+    if (d->type == decoder_type_alac && d->data != NULL)
+        ret = decoder_alac_get_output_format(d->data);
+    mutex_unlock(d->mutex);
     
+    return ret;
 }
 
 size_t decoder_decode(struct decoder_t* d, void* in_audio_data, size_t in_audio_data_size, void* out_audio_data, size_t out_audio_data_size) {
     
-    size_t ret = 0;
+    if (d == NULL || in_audio_data == NULL || in_audio_data_size == 0 || out_audio_data == NULL || out_audio_data_size == 0)
+        return 0;
     
     mutex_lock(d->mutex);
-    
-    if (d->type == decoder_type_alac)
+    size_t ret = 0;
+    if (d->type == decoder_type_alac && d->data != NULL)
         ret = decoder_alac_decode(d->data, in_audio_data, in_audio_data_size, out_audio_data, out_audio_data_size);
-    
     mutex_unlock(d->mutex);
     
-    return ret;
-    
+    return (ret <= out_audio_data_size ? ret : 0);
 }
 
 void decoder_reset(struct decoder_t* d) {
     
+    if (d == NULL)
+        return;
+    
     mutex_lock(d->mutex);
-    
-    if (d->type == decoder_type_alac)
+    if (d->type == decoder_type_alac && d->data != NULL)
         decoder_alac_reset(d->data);
-    
     mutex_unlock(d->mutex);
-    
 }
