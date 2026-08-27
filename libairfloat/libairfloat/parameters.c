@@ -51,6 +51,9 @@ struct parameters_t {
 
 void _parameters_parse(struct parameters_t* p, const void* data, size_t data_size, const char* delimiter, const char* key_value_seperator) {
     
+    if (p == NULL || data == NULL || data_size == 0 || delimiter == NULL || key_value_seperator == NULL)
+        return;
+    
     size_t delimiter_length = strlen(delimiter);
     size_t key_value_seperator_length = strlen(key_value_seperator);
     
@@ -69,6 +72,9 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
                 struct parameter_t new_parameter = { NULL, NULL };
                 
                 new_parameter.key = (char*)malloc(line_length + 1);
+                if (new_parameter.key == NULL)
+                    return;
+                
                 memcpy(new_parameter.key, line_start, line_length);
                 new_parameter.key[line_length] = '\0';
                 new_parameter.value = strstr(new_parameter.key, key_value_seperator);
@@ -85,7 +91,12 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
                     }
                 }
                 
-                p->parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
+                struct parameter_t* parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
+                if (parameters == NULL) {
+                    free(new_parameter.key);
+                    return;
+                }
+                p->parameters = parameters;
                 p->parameters[p->parameters_count] = new_parameter;
                 p->parameters_count++;
                 
@@ -106,6 +117,9 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
 }
 
 void _parameters_parse_http_authentication(struct parameters_t* p, const void* buffer, size_t size) {
+    
+    if (p == NULL || buffer == NULL || size == 0)
+        return;
     
     _parameters_parse(p, buffer, size, ",", "=");
     
@@ -182,8 +196,13 @@ size_t _parameters_write_http_header(struct parameters_t* p, void* buffer, size_
 struct parameters_t* parameters_create(const void* buffer, size_t size, enum parameters_type type) {
     
     struct parameters_t* p = (struct parameters_t*)malloc(sizeof(struct parameters_t));
+    if (p == NULL)
+        return NULL;
+    
     bzero(p, sizeof(struct parameters_t));
-    memset(p, 0, sizeof(struct parameters_t));
+    
+    if (buffer == NULL || size == 0)
+        return p;
     
     switch (type) {
         case parameters_type_text:
@@ -279,17 +298,27 @@ void parameters_set_value(struct parameters_t* p, const char* key, const char* v
     for (uint32_t i = 0 ; i < p->parameters_count ; i++)
         if (0 == strcmp(p->parameters[i].key, key)) {
             struct parameter_t* c_param = &p->parameters[i];
-            c_param->key = (char*)realloc(c_param->key, key_len + value_len + 2);
+            char* parameter_data = (char*)realloc(c_param->key, key_len + value_len + 2);
+            if (parameter_data == NULL)
+                return;
+            c_param->key = parameter_data;
             c_param->value = &c_param->key[key_len + 1];
+            strcpy(c_param->key, key);
             strcpy(c_param->value, new_value);
             return;
         }
     
-    p->parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
-    struct parameter_t* parameter = &p->parameters[p->parameters_count];
-    p->parameters_count++;
+    struct parameter_t* parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
+    if (parameters == NULL)
+        return;
+    p->parameters = parameters;
     
+    struct parameter_t* parameter = &p->parameters[p->parameters_count];
     parameter->key = (char*)malloc(key_len + value_len + 2);
+    if (parameter->key == NULL)
+        return;
+    
+    p->parameters_count++;
     parameter->value = &parameter->key[key_len + 1];
     strcpy(parameter->key, key);
     strcpy(parameter->value, new_value);
