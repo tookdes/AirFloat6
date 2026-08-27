@@ -50,25 +50,29 @@ struct mutex_t {
 struct mutex_t* mutex_create() {
     
     struct mutex_t* m = (struct mutex_t*)malloc(sizeof(struct mutex_t));
+    if (m == NULL)
+        return NULL;
     bzero(m, sizeof(struct mutex_t));
     
-    pthread_mutex_init(&m->mutex, NULL);
+    if (pthread_mutex_init(&m->mutex, NULL) != 0) {
+        free(m);
+        return NULL;
+    }
     
     return m;
-    
 }
 
 void mutex_destroy(struct mutex_t* m) {
     
+    if (m == NULL)
+        return;
     pthread_mutex_destroy(&m->mutex);
     free(m);
-        
 }
 
 bool mutex_trylock(struct mutex_t* m) {
     
-    return (pthread_mutex_trylock(&m->mutex) == 0);
-    
+    return (m != NULL && pthread_mutex_trylock(&m->mutex) == 0);
 }
 
 void mutex_lock(struct mutex_t* m) {
@@ -80,7 +84,6 @@ void mutex_lock(struct mutex_t* m) {
         m->locked = true;
 #endif
     }
-    
 }
 
 void mutex_unlock(struct mutex_t* m) {
@@ -92,13 +95,11 @@ void mutex_unlock(struct mutex_t* m) {
 #endif
         pthread_mutex_unlock(&m->mutex);
     }
-    
 }
 
 pthread_mutex_t* mutex_pthread(struct mutex_t* m) {
     
-    return &m->mutex;
-    
+    return m != NULL ? &m->mutex : NULL;
 }
 
 #endif
