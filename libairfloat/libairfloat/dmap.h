@@ -32,6 +32,7 @@
 #define _dmap_h
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define DMAP_INDEX_NOT_FOUND UINT32_MAX
 
