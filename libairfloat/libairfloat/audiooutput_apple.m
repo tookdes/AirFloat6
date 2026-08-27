@@ -34,6 +34,7 @@
 #import <stdbool.h>
 
 #import <TargetConditionals.h>
+#import <AudioToolbox/AudioToolbox.h>
 #if TARGET_OS_IPHONE
 #import <UIKit/UIKit.h>
 #endif
@@ -41,8 +42,6 @@
 
 #import "log.h"
 #import "audiooutput.h"
-
-#define ca_assert(error) assert((error) == noErr)
 
 double hardware_host_time_to_seconds(double host_time);
 
@@ -61,7 +60,17 @@ struct audio_output_t {
 
 void audio_output_stop(struct audio_output_t* ao);
 
-AudioUnit _audio_output_create_add_unit(struct audio_output_t* ao, OSType type, OSType subtype, OSType manufacturer, AUNode* node) {
+static bool _audio_output_check_status(OSStatus status, const char* operation) {
+    if (status == noErr)
+        return true;
+    log_message(LOG_ERROR, "CoreAudio %s failed (%d)", operation, (int)status);
+    return false;
+}
+
+static bool _audio_output_create_add_unit(struct audio_output_t* ao, OSType type, OSType subtype, OSType manufacturer, AUNode* node, AudioUnit* unit) {
+    
+    if (ao == NULL || ao->graph == NULL || node == NULL || unit == NULL)
+        return false;
     
     AudioComponentDescription desc;
     bzero(&desc, sizeof(AudioComponentDescription));
@@ -69,65 +78,115 @@ AudioUnit _audio_output_create_add_unit(struct audio_output_t* ao, OSType type, 
     desc.componentSubType = subtype;
     desc.componentManufacturer = manufacturer;
     
-    AudioUnit unit;
+    if (!_audio_output_check_status(AUGraphAddNode(ao->graph, &desc, node), "AUGraphAddNode"))
+        return false;
+    if (!_audio_output_check_status(AUGraphNodeInfo(ao->graph, *node, NULL, unit), "AUGraphNodeInfo"))
+        return false;
+    
     UInt32 maximumSlicesPerFrame = 4096;
-    ca_assert(AUGraphAddNode(ao->graph, &desc, node));
-    ca_assert(AUGraphNodeInfo(ao->graph, *node, NULL, &unit));
-    ca_assert(AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maximumSlicesPerFrame, sizeof(UInt32)));
+    OSStatus status = AudioUnitSetProperty(*unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maximumSlicesPerFrame, sizeof(UInt32));
+    if (status != noErr)
+        log_message(LOG_ERROR, "Unable to set maximum AudioUnit slice size (%d)", (int)status);
     
-    return unit;
-    
+    return true;
 }
 
-void _audio_output_connect_unit(struct audio_output_t* ao, AUNode output_node, UInt32 output_node_bus, AUNode input_node, UInt32 input_node_bus) {
+static bool _audio_output_connect_unit(struct audio_output_t* ao, AUNode output_node, UInt32 output_node_bus, AUNode input_node, UInt32 input_node_bus) {
     
-    AudioUnit output_unit, input_unit;
-    ca_assert(AUGraphNodeInfo(ao->graph, output_node, NULL, &output_unit));
-    ca_assert(AUGraphNodeInfo(ao->graph, input_node, NULL, &input_unit));
+    if (ao == NULL || ao->graph == NULL)
+        return false;
+    
+    AudioUnit output_unit = NULL;
+    AudioUnit input_unit = NULL;
+    if (!_audio_output_check_status(AUGraphNodeInfo(ao->graph, output_node, NULL, &output_unit), "AUGraphNodeInfo(output)"))
+        return false;
+    if (!_audio_output_check_status(AUGraphNodeInfo(ao->graph, input_node, NULL, &input_unit), "AUGraphNodeInfo(input)"))
+        return false;
     
     AudioStreamBasicDescription out_desc;
     UInt32 size = sizeof(AudioStreamBasicDescription);
-    ca_assert(AudioUnitGetProperty(output_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, output_node_bus, &out_desc, &size));
-    if (noErr != AudioUnitSetProperty(input_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, input_node_bus, &out_desc, sizeof(AudioStreamBasicDescription))) {
-        
-        AudioStreamBasicDescription in_desc;
-        size = sizeof(AudioStreamBasicDescription);
-        ca_assert(AudioUnitGetProperty(input_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, input_node_bus, &in_desc, &size));
-        
-        AUNode converter_node;
-        AudioUnit converter_unit = _audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter, kAudioUnitManufacturer_Apple, &converter_node);
-        ca_assert(AudioUnitSetProperty(converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &out_desc, sizeof(AudioStreamBasicDescription)));
-        ca_assert(AudioUnitSetProperty(converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &in_desc, sizeof(AudioStreamBasicDescription)));
-        ca_assert(AUGraphConnectNodeInput(ao->graph, output_node, output_node_bus, converter_node, 0));
-        ca_assert(AUGraphConnectNodeInput(ao->graph, converter_node, 0, input_node, input_node_bus));
-        
-    } else
-        ca_assert(AUGraphConnectNodeInput(ao->graph, output_node, output_node_bus, input_node, input_node_bus));
+    if (!_audio_output_check_status(AudioUnitGetProperty(output_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, output_node_bus, &out_desc, &size), "AudioUnitGetProperty(output format)"))
+        return false;
     
+    OSStatus direct_status = AudioUnitSetProperty(input_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, input_node_bus, &out_desc, sizeof(AudioStreamBasicDescription));
+    if (direct_status == noErr)
+        return _audio_output_check_status(AUGraphConnectNodeInput(ao->graph, output_node, output_node_bus, input_node, input_node_bus), "AUGraphConnectNodeInput");
+    
+    AudioStreamBasicDescription in_desc;
+    size = sizeof(AudioStreamBasicDescription);
+    if (!_audio_output_check_status(AudioUnitGetProperty(input_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, input_node_bus, &in_desc, &size), "AudioUnitGetProperty(input format)"))
+        return false;
+    
+    AUNode converter_node;
+    AudioUnit converter_unit = NULL;
+    if (!_audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter, kAudioUnitManufacturer_Apple, &converter_node, &converter_unit))
+        return false;
+    
+    if (!_audio_output_check_status(AudioUnitSetProperty(converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &out_desc, sizeof(AudioStreamBasicDescription)), "AudioUnitSetProperty(converter input)"))
+        return false;
+    if (!_audio_output_check_status(AudioUnitSetProperty(converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &in_desc, sizeof(AudioStreamBasicDescription)), "AudioUnitSetProperty(converter output)"))
+        return false;
+    if (!_audio_output_check_status(AUGraphConnectNodeInput(ao->graph, output_node, output_node_bus, converter_node, 0), "AUGraphConnectNodeInput(converter input)"))
+        return false;
+    if (!_audio_output_check_status(AUGraphConnectNodeInput(ao->graph, converter_node, 0, input_node, input_node_bus), "AUGraphConnectNodeInput(converter output)"))
+        return false;
+    
+    return true;
 }
 
 OSStatus _audio_unit_render_callback(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
     
     struct audio_output_t* ao = (struct audio_output_t*)inRefCon;
+    if (ao == NULL || ioData == NULL || ioData->mNumberBuffers == 0 || ioData->mBuffers[0].mData == NULL)
+        return noErr;
     
     bzero(ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize);
     
-    ca_assert(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 1.0, 0));
+    /* Do not assert or log from the real-time render callback. A transient
+       AudioUnit state error must not terminate the process or block audio. */
+    if (ao->mixer_unit != NULL)
+        AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 1.0, 0);
     
-    if (ao->callback)
-        ao->callback(ao, ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize, hardware_host_time_to_seconds(inTimeStamp->mHostTime), ao->callback_ctx);
+    audio_output_callback callback = ao->callback;
+    void* callback_ctx = ao->callback_ctx;
+    if (callback != NULL && inTimeStamp != NULL)
+        callback(ao, ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize, hardware_host_time_to_seconds(inTimeStamp->mHostTime), callback_ctx);
     
     return noErr;
+}
+
+static void _audio_output_dispose(struct audio_output_t* ao) {
+    if (ao == NULL)
+        return;
     
+    ao->callback = NULL;
+    ao->callback_ctx = NULL;
+    
+    if (ao->graph != NULL) {
+        AUGraphStop(ao->graph);
+        AUGraphUninitialize(ao->graph);
+        OSStatus status = DisposeAUGraph(ao->graph);
+        if (status != noErr)
+            log_message(LOG_ERROR, "CoreAudio DisposeAUGraph failed (%d)", (int)status);
+        ao->graph = NULL;
+    }
 }
 
 struct audio_output_t* audio_output_create(struct decoder_output_format_t decoder_output_format) {
     
+    if (decoder_output_format.sample_rate == 0 || decoder_output_format.channels == 0 ||
+        decoder_output_format.bit_depth == 0 || decoder_output_format.frame_size == 0)
+        return NULL;
+    
     struct audio_output_t* ao = (struct audio_output_t*)malloc(sizeof(struct audio_output_t));
+    if (ao == NULL)
+        return NULL;
     bzero(ao, sizeof(struct audio_output_t));
     
-    ca_assert(NewAUGraph(&ao->graph));
-    ca_assert(AUGraphOpen(ao->graph));
+    if (!_audio_output_check_status(NewAUGraph(&ao->graph), "NewAUGraph") || ao->graph == NULL)
+        goto failed;
+    if (!_audio_output_check_status(AUGraphOpen(ao->graph), "AUGraphOpen"))
+        goto failed;
     
     AudioStreamBasicDescription in_desc;
     bzero(&in_desc, sizeof(AudioStreamBasicDescription));
@@ -139,205 +198,247 @@ struct audio_output_t* audio_output_create(struct decoder_output_format_t decode
     in_desc.mFramesPerPacket = 1;
     
     UInt32 size = sizeof(AudioStreamBasicDescription);
-    ca_assert(AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, NULL, &size, &in_desc));
+    if (!_audio_output_check_status(AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, NULL, &size, &in_desc), "AudioFormatGetProperty"))
+        goto failed;
     
     AUNode mixer_node;
-    ao->mixer_unit = _audio_output_create_add_unit(ao, kAudioUnitType_Mixer, kAudioUnitSubType_MultiChannelMixer, kAudioUnitManufacturer_Apple, &mixer_node);
+    if (!_audio_output_create_add_unit(ao, kAudioUnitType_Mixer, kAudioUnitSubType_MultiChannelMixer, kAudioUnitManufacturer_Apple, &mixer_node, &ao->mixer_unit))
+        goto failed;
     
 #if TARGET_OS_MAC
-    ca_assert(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Output, 0, 1.0, 0));
+    if (!_audio_output_check_status(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Output, 0, 1.0, 0), "AudioUnitSetParameter(mixer volume)"))
+        goto failed;
 #endif
     
     AUNode input_node = mixer_node;
     
     OSStatus err = AudioUnitSetProperty(ao->mixer_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &in_desc, sizeof(AudioStreamBasicDescription));
     if (err != noErr) {
-        
         AUNode converter_node;
-        ao->converter_unit = _audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter, kAudioUnitManufacturer_Apple, &converter_node);
+        if (!_audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter, kAudioUnitManufacturer_Apple, &converter_node, &ao->converter_unit))
+            goto failed;
         
-        ca_assert(AudioUnitSetProperty(ao->converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &in_desc, sizeof(AudioStreamBasicDescription)));
+        if (!_audio_output_check_status(AudioUnitSetProperty(ao->converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &in_desc, sizeof(AudioStreamBasicDescription)), "AudioUnitSetProperty(input converter input)"))
+            goto failed;
+        
         AudioStreamBasicDescription mixer_output_desc;
         size = sizeof(AudioStreamBasicDescription);
-        ca_assert(AudioUnitGetProperty(ao->mixer_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &mixer_output_desc, &size));
-        ca_assert(AudioUnitSetProperty(ao->converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &mixer_output_desc, size));
-        _audio_output_connect_unit(ao, converter_node, 0, mixer_node, 0);
+        if (!_audio_output_check_status(AudioUnitGetProperty(ao->mixer_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &mixer_output_desc, &size), "AudioUnitGetProperty(mixer input format)"))
+            goto failed;
+        if (!_audio_output_check_status(AudioUnitSetProperty(ao->converter_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &mixer_output_desc, size), "AudioUnitSetProperty(input converter output)"))
+            goto failed;
+        if (!_audio_output_connect_unit(ao, converter_node, 0, mixer_node, 0))
+            goto failed;
         
         input_node = converter_node;
-        
     }
     
     AURenderCallbackStruct render_callback;
     render_callback.inputProc = _audio_unit_render_callback;
     render_callback.inputProcRefCon = ao;
-    
-    ca_assert(AUGraphSetNodeInputCallback(ao->graph, input_node, 0, &render_callback));
+    if (!_audio_output_check_status(AUGraphSetNodeInputCallback(ao->graph, input_node, 0, &render_callback), "AUGraphSetNodeInputCallback"))
+        goto failed;
     
     AUNode output_node;
 #if TARGET_OS_IPHONE
-    ao->output_unit = _audio_output_create_add_unit(ao, kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, &output_node);
+    if (!_audio_output_create_add_unit(ao, kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, &output_node, &ao->output_unit))
+        goto failed;
 #else
-    ao->output_unit = _audio_output_create_add_unit(ao, kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, &output_node);
+    if (!_audio_output_create_add_unit(ao, kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, &output_node, &ao->output_unit))
+        goto failed;
 #endif
     
-    double use_speed = true;
+    bool use_speed = true;
 #if TARGET_OS_IPHONE
     @autoreleasepool {
         use_speed = [[UIDevice currentDevice].systemVersion floatValue] >= 6;
     }
 #endif
     
-    if (use_speed) { // Darwin 11 is iOS 5. Varispeed is only available in iOS 5+.
-        
-        ao->has_speed_control = true;
+    if (use_speed) {
         AUNode speed_node;
-        ao->speed_unit = _audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_Varispeed, kAudioUnitManufacturer_Apple, &speed_node);
-        _audio_output_connect_unit(ao, mixer_node, 0, speed_node, 0);
-        
-        _audio_output_connect_unit(ao, speed_node, 0, output_node, 0);
-        
-    } else
-        _audio_output_connect_unit(ao, mixer_node, 0, output_node, 0);
+        if (!_audio_output_create_add_unit(ao, kAudioUnitType_FormatConverter, kAudioUnitSubType_Varispeed, kAudioUnitManufacturer_Apple, &speed_node, &ao->speed_unit))
+            goto failed;
+        if (!_audio_output_connect_unit(ao, mixer_node, 0, speed_node, 0))
+            goto failed;
+        if (!_audio_output_connect_unit(ao, speed_node, 0, output_node, 0))
+            goto failed;
+        ao->has_speed_control = true;
+    } else {
+        if (!_audio_output_connect_unit(ao, mixer_node, 0, output_node, 0))
+            goto failed;
+    }
     
-    ca_assert(AUGraphInitialize(ao->graph));
-    ca_assert(AUGraphUpdate(ao->graph, NULL));
+    if (!_audio_output_check_status(AUGraphInitialize(ao->graph), "AUGraphInitialize"))
+        goto failed;
+    if (!_audio_output_check_status(AUGraphUpdate(ao->graph, NULL), "AUGraphUpdate"))
+        goto failed;
     
     return ao;
     
+failed:
+    _audio_output_dispose(ao);
+    free(ao);
+    return NULL;
 }
 
 void audio_output_destroy(struct audio_output_t* ao) {
     
-    audio_output_stop(ao);
+    if (ao == NULL)
+        return;
     
-    ca_assert(AUGraphUninitialize(ao->graph));
-    ca_assert(DisposeAUGraph(ao->graph));
-    
+    _audio_output_dispose(ao);
     free(ao);
-    
 }
 
 void audio_output_set_callback(struct audio_output_t* ao, audio_output_callback callback, void* ctx) {
     
+    if (ao == NULL)
+        return;
     ao->callback = callback;
     ao->callback_ctx = ctx;
-    
 }
 
 void audio_output_session_start () {
     
+#if TARGET_OS_IPHONE
+    @autoreleasepool {
         double sampleRate = 44100.0;
         float frameCount = 4096.0f;
-        double bufferLength = (frameCount/sampleRate);   // 1500ms
-    
-        // AVAudioSession: Sample Rate
+        double bufferLength = (frameCount / sampleRate);
+        
         NSError *rateError = nil;
         [[AVAudioSession sharedInstance] setPreferredSampleRate:sampleRate error:&rateError];
-        if (rateError) {
+        if (rateError)
             log_message(LOG_ERROR, "Error setting SampleRate: %@", [rateError description]);
-        }
         
-        // AVAudioSession: Buffer Duration
         NSError *bufferError = nil;
         [[AVAudioSession sharedInstance] setPreferredIOBufferDuration:bufferLength error:&bufferError];
-        if (bufferError) {
+        if (bufferError)
             log_message(LOG_ERROR, "Error setting BufferDuration: %@", [bufferError description]);
-        }
         
-        // AVAudioSession: Category
         NSError *categoryError = nil;
-        [[AVAudioSession sharedInstance] setCategory: AVAudioSessionCategoryPlayback error:&categoryError];
-        if (categoryError) {
+        [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&categoryError];
+        if (categoryError)
             log_message(LOG_ERROR, "Error setting Category: %@", [categoryError description]);
-        }
         
-        // AVAudioSession: Activation
         NSError *activationError = nil;
-        BOOL didActivate = [[AVAudioSession sharedInstance] setActive: YES error: &activationError];
+        BOOL didActivate = [[AVAudioSession sharedInstance] setActive:YES error:&activationError];
         if (!didActivate) {
-            if (activationError) {
+            if (activationError)
                 log_message(LOG_ERROR, "Could not activate AVAudioSession, Error %@", [activationError localizedDescription]);
-            } else {
+            else
                 log_message(LOG_ERROR, "Could not activate AVAudioSession");
-            }
         }
+    }
+#endif
 }
 
 void audio_output_session_stop () {
     
-    // AVAudioSession: De-Activation
-    NSError *deactivationError = nil;
-    BOOL didDeactivate = [[AVAudioSession sharedInstance] setActive:NO withOptions: AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error: &deactivationError];
-    if (!didDeactivate) {
-        if (deactivationError) {
-            log_message(LOG_ERROR, "Could not deactivate AVAudioSession, Error %@", [deactivationError localizedDescription]);
-        } else {
-            log_message(LOG_ERROR, "Could not deactivate AVAudioSession");
+#if TARGET_OS_IPHONE
+    @autoreleasepool {
+        NSError *deactivationError = nil;
+        BOOL didDeactivate = [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:&deactivationError];
+        if (!didDeactivate) {
+            if (deactivationError)
+                log_message(LOG_ERROR, "Could not deactivate AVAudioSession, Error %@", [deactivationError localizedDescription]);
+            else
+                log_message(LOG_ERROR, "Could not deactivate AVAudioSession");
         }
     }
+#endif
 }
 
 void audio_output_start(struct audio_output_t* ao) {
     
+    if (ao == NULL || ao->graph == NULL)
+        return;
+    
 #if TARGET_OS_IPHONE
-    @autoreleasepool {
-        audio_output_session_start();
-    }
+    audio_output_session_start();
 #endif
     
-    ca_assert(AUGraphStart(ao->graph));
-    
+    OSStatus status = AUGraphStart(ao->graph);
+    if (status != noErr) {
+        log_message(LOG_ERROR, "CoreAudio AUGraphStart failed (%d)", (int)status);
+#if TARGET_OS_IPHONE
+        audio_output_session_stop();
+#endif
+    }
 }
 
 void audio_output_stop(struct audio_output_t* ao) {
     
-    ca_assert(AUGraphStop(ao->graph));
+    if (ao == NULL || ao->graph == NULL)
+        return;
+    
+    OSStatus status = AUGraphStop(ao->graph);
+    if (status != noErr)
+        log_message(LOG_ERROR, "CoreAudio AUGraphStop failed (%d)", (int)status);
     
 #if TARGET_OS_IPHONE
-    @autoreleasepool {
-        audio_output_session_stop();
-    }
+    audio_output_session_stop();
 #endif
-    
 }
 
 void audio_output_flush(struct audio_output_t* ao) {
     
-    ca_assert(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 0.0, 0));
-    
+    if (ao == NULL || ao->mixer_unit == NULL)
+        return;
+    OSStatus status = AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 0.0, 0);
+    if (status != noErr)
+        log_message(LOG_ERROR, "CoreAudio flush failed (%d)", (int)status);
 }
 
 double audio_output_get_playback_rate(audio_output_p ao) {
     
-    AudioUnitParameterValue value = 1.0;
+    if (ao == NULL || !ao->has_speed_control || ao->speed_unit == NULL)
+        return 1.0;
     
-    if (ao->has_speed_control) {
-        ca_assert(AudioUnitGetParameter(ao->speed_unit, kVarispeedParam_PlaybackRate, kAudioUnitScope_Global, 0, &value));
+    AudioUnitParameterValue value = 1.0;
+    OSStatus status = AudioUnitGetParameter(ao->speed_unit, kVarispeedParam_PlaybackRate, kAudioUnitScope_Global, 0, &value);
+    if (status != noErr) {
+        log_message(LOG_ERROR, "Unable to read playback rate (%d)", (int)status);
+        return 1.0;
     }
     
     return value;
-    
 }
 
 void audio_output_set_playback_rate(audio_output_p ao, double playback_rate) {
     
-    if (ao->has_speed_control) {
-        AudioUnitParameterValue value = playback_rate;
-        ca_assert(AudioUnitSetParameter(ao->speed_unit, kVarispeedParam_PlaybackRate, kAudioUnitScope_Global, 0, value, 0));
-    }
+    if (ao == NULL || !ao->has_speed_control || ao->speed_unit == NULL)
+        return;
     
+    AudioUnitParameterValue value = (AudioUnitParameterValue)playback_rate;
+    OSStatus status = AudioUnitSetParameter(ao->speed_unit, kVarispeedParam_PlaybackRate, kAudioUnitScope_Global, 0, value, 0);
+    if (status != noErr)
+        log_message(LOG_ERROR, "Unable to set playback rate (%d)", (int)status);
 }
 
 void audio_output_set_volume(struct audio_output_t* ao, double volume) {
     
-    ca_assert(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, 0, volume, 0));
+    if (ao == NULL || ao->mixer_unit == NULL)
+        return;
     
+    if (volume < 0.0)
+        volume = 0.0;
+    else if (volume > 1.0)
+        volume = 1.0;
+    
+    OSStatus status = AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, 0, (AudioUnitParameterValue)volume, 0);
+    if (status != noErr)
+        log_message(LOG_ERROR, "Unable to set output volume (%d)", (int)status);
 }
 
 void audio_output_set_muted(struct audio_output_t* ao, bool muted) {
     
-    ca_assert(AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Input, 0, (muted ? 0.0 : 1.0), 0));
-    
+    if (ao == NULL || ao->mixer_unit == NULL)
+        return;
+    OSStatus status = AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Input, 0, (muted ? 0.0 : 1.0), 0);
+    if (status != noErr)
+        log_message(LOG_ERROR, "Unable to change mute state (%d)", (int)status);
 }
 
 #endif
