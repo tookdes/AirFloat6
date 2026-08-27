@@ -37,33 +37,45 @@
 
 size_t web_tools_convert_new_lines(void* data, size_t data_size) {
     
+    if (data == NULL || data_size == 0)
+        return 0;
+    
+    char* bytes = (char*)data;
+    
     for (size_t i = 0; i < data_size; i++) {
-        if (((char*)data)[i] == '\r') {
-            if (i < data_size - 1 && ((char*)data)[i+1] == '\n') { // if newline is \r\n then remove \n. Else make \r to \n.
-                memcpy(data + i, data + i + 1, data_size - (i + 1));
-                i--;
+        if (bytes[i] == '\r') {
+            if (i + 1 < data_size && bytes[i + 1] == '\n') {
+                /* Remove the CR from CRLF. Source and destination overlap. */
+                memmove(bytes + i, bytes + i + 1, data_size - (i + 1));
                 data_size--;
+                if (i > 0)
+                    i--;
             } else
-                ((char*)data)[i] = '\n';
-        } if (i < data_size - 1 && ((char*)data)[i] == '\n' && ((char*)data)[i+1] == '\n')
+                bytes[i] = '\n';
+        }
+        
+        if (i + 1 < data_size && bytes[i] == '\n' && bytes[i + 1] == '\n')
             break;
     }
     
     return data_size;
-    
 }
 
 const char* web_tools_get_content_start(const void* data, size_t data_size) {
     
+    if (data == NULL || data_size == 0)
+        return NULL;
+    
+    const char* bytes = (const char*)data;
+    
     for (size_t i = 0; i < data_size; i++) {
-        if (i < data_size - 3 && memcmp(data + i, "\r\n\r\n", 4) == 0)
-            return data + i + 4;
-        if (i < data_size - 1 && memcmp(data + i, "\n\n", 2) == 0)
-            return data + i + 2;
-        if (i < data_size - 1 && memcmp(data + i, "\r\r", 2) == 0)
-            return data + i + 2;
+        if (i + 4 <= data_size && memcmp(bytes + i, "\r\n\r\n", 4) == 0)
+            return bytes + i + 4;
+        if (i + 2 <= data_size && memcmp(bytes + i, "\n\n", 2) == 0)
+            return bytes + i + 2;
+        if (i + 2 <= data_size && memcmp(bytes + i, "\r\r", 2) == 0)
+            return bytes + i + 2;
     }
     
     return NULL;
-    
 }
