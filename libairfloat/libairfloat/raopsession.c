@@ -65,6 +65,10 @@
 #include "raopsession.h"
 
 #define MAX(x,y) (x > y ? x : y)
+#define RAOP_RSA_KEY_SIZE 256
+#define RAOP_AES_KEY_SIZE 16
+#define RAOP_RSA_KEY_BASE64_MAX 512
+#define RAOP_AES_IV_BASE64_MAX 64
 
 void raop_server_session_ended(raop_server_p rs, struct raop_session_t* session);
 
@@ -111,6 +115,53 @@ struct raop_session_t {
     unsigned int start_rtp_timestamp;
     double total_length;
 };
+
+bool _raop_session_decode_base64_bounded(const char* encoded, size_t max_encoded_length, unsigned char** decoded, size_t* decoded_length) {
+    
+    if (decoded != NULL)
+        *decoded = NULL;
+    if (decoded_length != NULL)
+        *decoded_length = 0;
+    
+    if (encoded == NULL || decoded == NULL || decoded_length == NULL)
+        return false;
+    
+    size_t encoded_length = strlen(encoded);
+    if (encoded_length == 0 || encoded_length > max_encoded_length)
+        return false;
+    
+    size_t padded_capacity = encoded_length + 5;
+    char* padded = (char*)malloc(padded_capacity);
+    if (padded == NULL)
+        return false;
+    
+    size_t padded_length = base64_pad(encoded, encoded_length, padded, padded_capacity);
+    if (padded_length == 0 || padded_length % 4 != 0) {
+        free(padded);
+        return false;
+    }
+    
+    size_t decoded_capacity = (padded_length / 4) * 3;
+    unsigned char* buffer = (unsigned char*)malloc(decoded_capacity > 0 ? decoded_capacity : 1);
+    if (buffer == NULL) {
+        free(padded);
+        return false;
+    }
+    
+    size_t size = base64_decode(padded, buffer);
+    free(padded);
+    
+    if (size == (size_t)-1 || size > decoded_capacity) {
+        free(buffer);
+        return false;
+    }
+    
+    *decoded = buffer;
+    *decoded_length = size;
+    
+    return true;
+    
+}
 
 void recorder_updated_track_position_callback(rtp_recorder_p rr, unsigned int curr, void* ctx) {
     struct raop_session_t* rs = (struct raop_session_t*)ctx;
@@ -267,12 +318,13 @@ void _raop_session_get_apple_response(struct raop_session_t* rs, const char* cha
         char* a_encrypted_response;
         size_t a_len = base64_encode(encrypted_response, size, &a_encrypted_response);
         
-        if (response != NULL)
-            memcpy(response, a_encrypted_response, a_len);
-        if (response_length != NULL)
-            *response_length = a_len;
-        
-        free(a_encrypted_response);
+        if (a_len != (size_t)-1) {
+            if (response != NULL)
+                memcpy(response, a_encrypted_response, a_len);
+            if (response_length != NULL)
+                *response_length = a_len;
+            free(a_encrypted_response);
+        }
         
     } else
         log_message(LOG_ERROR, "Unable to encrypt Apple response");
@@ -387,6 +439,8 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
                         const char* rtp_fmtp = fmtp_separator + 1;
                         
                         mutex_lock(rs->mutex);
+                        if (rs->decoder != NULL)
+                            decoder_destroy(rs->decoder);
                         rs->decoder = decoder_create(codec, rtp_fmtp);
                         mutex_unlock(rs->mutex);
                         
@@ -398,33 +452,42 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
                             if (aes_key_base64_encrypted != NULL) {
                                 
                                 const char* aes_initializer_base64 = parameters_value_for_key(parameters, "a-aesiv");
-                                if (aes_initializer_base64 != NULL) {
+                                unsigned char* encrypted_key = NULL;
+                                unsigned char* aes_initializer = NULL;
+                                size_t encrypted_key_size = 0;
+                                size_t aes_initializer_size = 0;
+                                bool aes_valid = false;
+                                
+                                if (aes_initializer_base64 != NULL &&
+                                    _raop_session_decode_base64_bounded(aes_key_base64_encrypted, RAOP_RSA_KEY_BASE64_MAX, &encrypted_key, &encrypted_key_size) &&
+                                    encrypted_key_size == RAOP_RSA_KEY_SIZE) {
                                     
-                                    size_t aes_key_base64_encrypted_padded_length = strlen(aes_key_base64_encrypted) + 5;
-                                    char aes_key_base64_encrypted_padded[aes_key_base64_encrypted_padded_length];
-                                    size_t size = base64_pad(aes_key_base64_encrypted, strlen(aes_key_base64_encrypted), aes_key_base64_encrypted_padded, aes_key_base64_encrypted_padded_length);
-                                    char aes_key_encryptet[size];
-                                    size = base64_decode(aes_key_base64_encrypted_padded, aes_key_encryptet);
+                                    unsigned char aes_key[RAOP_RSA_KEY_SIZE];
+                                    size_t aes_key_size = crypt_apple_private_decrypt(encrypted_key, encrypted_key_size, aes_key, sizeof(aes_key));
                                     
-                                    unsigned char aes_key[size + 1];
-                                    size = crypt_apple_private_decrypt(aes_key_encryptet, size, aes_key, size);
-                                    
-                                    log_message(LOG_INFO, "AES key length: %d bits", size * 8);
-                                    
-                                    size_t aes_initializer_base64_encoded_padded_length = strlen(aes_initializer_base64) + 5;
-                                    char aes_initializer_base64_encoded_padded[aes_initializer_base64_encoded_padded_length];
-                                    size = base64_pad(aes_initializer_base64, strlen(aes_initializer_base64), aes_initializer_base64_encoded_padded, aes_initializer_base64_encoded_padded_length);
-                                    char aes_initializer[size];
-                                    size = base64_decode(aes_initializer_base64_encoded_padded, aes_initializer);
-                                    
-                                    if (size > 0) {
+                                    if (aes_key_size == RAOP_AES_KEY_SIZE &&
+                                        _raop_session_decode_base64_bounded(aes_initializer_base64, RAOP_AES_IV_BASE64_MAX, &aes_initializer, &aes_initializer_size) &&
+                                        aes_initializer_size == RAOP_AES_KEY_SIZE) {
+                                        
+                                        log_message(LOG_INFO, "AES key length: %d bits", aes_key_size * 8);
+                                        
                                         mutex_lock(rs->mutex);
-                                        rs->crypt_aes = crypt_aes_create(aes_key, aes_initializer, size);
+                                        if (rs->crypt_aes != NULL)
+                                            crypt_aes_destroy(rs->crypt_aes);
+                                        rs->crypt_aes = crypt_aes_create(aes_key, aes_initializer, RAOP_AES_KEY_SIZE);
+                                        aes_valid = (rs->crypt_aes != NULL);
                                         mutex_unlock(rs->mutex);
-                                    } else
-                                        web_response_set_status(response, 400, "Bad Request");
+                                        
+                                    }
                                     
-                                } else
+                                }
+                                
+                                if (encrypted_key != NULL)
+                                    free(encrypted_key);
+                                if (aes_initializer != NULL)
+                                    free(aes_initializer);
+                                
+                                if (!aes_valid)
                                     web_response_set_status(response, 400, "Bad Request");
                                 
                             }
@@ -446,7 +509,7 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
                     const char* transport = web_headers_value(request_headers, "Transport");
                     if (transport != NULL) {
                         
-                        parameters_p transport_params = parameters_create(transport, strlen(transport) + 1, parameters_type_http_header);
+                        parameters_p transport_params = parameters_create(transport, strlen(transport), parameters_type_http_header);
                         
                         if (transport_params != NULL) {
                             
@@ -482,22 +545,35 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
                                     
                                     uint32_t session_id = ++rs->rtp_last_session_id;
                                     rs->rtp_session = (struct raop_rtp_session_t*)malloc(sizeof(struct raop_rtp_session_t));
-                                    rs->rtp_session->queue = audio_queue;
-                                    rs->rtp_session->recorder = new_recorder;
-                                    rs->rtp_session->session_id = session_id;
+                                    if (rs->rtp_session != NULL) {
+                                        rs->rtp_session->queue = audio_queue;
+                                        rs->rtp_session->recorder = new_recorder;
+                                        rs->rtp_session->session_id = session_id;
+                                        
+                                        web_headers_set_value(response_headers, "Session", "%d", session_id);
+                                        
+                                        parameters_set_value(transport_params, "timing_port", "%d", rtp_recorder_get_timing_port(new_recorder));
+                                        parameters_set_value(transport_params, "control_port", "%d", rtp_recorder_get_control_port(new_recorder));
+                                        parameters_set_value(transport_params, "server_port", "%d", rtp_recorder_get_streaming_port(new_recorder));
+                                        
+                                        size_t transport_reply_len = parameters_write(transport_params, NULL, 0, parameters_type_http_header);
+                                        if (transport_reply_len > 0) {
+                                            char transport_reply[transport_reply_len];
+                                            parameters_write(transport_params, transport_reply, transport_reply_len, parameters_type_http_header);
+                                            web_headers_set_value(response_headers, "Transport", transport_reply);
+                                            setup_complete = true;
+                                        }
+                                    }
                                     
-                                    web_headers_set_value(response_headers, "Session", "%d", session_id);
-                                    
-                                    parameters_set_value(transport_params, "timing_port", "%d", rtp_recorder_get_timing_port(new_recorder));
-                                    parameters_set_value(transport_params, "control_port", "%d", rtp_recorder_get_control_port(new_recorder));
-                                    parameters_set_value(transport_params, "server_port", "%d", rtp_recorder_get_streaming_port(new_recorder));
-                                    
-                                    size_t transport_reply_len = parameters_write(transport_params, NULL, 0, parameters_type_http_header);
-                                    char transport_reply[transport_reply_len];
-                                    parameters_write(transport_params, transport_reply, transport_reply_len, parameters_type_http_header);
-                                    
-                                    web_headers_set_value(response_headers, "Transport", transport_reply);
-                                    setup_complete = true;
+                                    if (!setup_complete) {
+                                        if (rs->rtp_session != NULL) {
+                                            free(rs->rtp_session);
+                                            rs->rtp_session = NULL;
+                                        }
+                                        rtp_recorder_destroy(new_recorder);
+                                        audio_queue_destroy(audio_queue);
+                                        web_response_set_status(response, 453, "Not Enough Bandwidth");
+                                    }
                                     
                                 } else {
                                     audio_queue_destroy(audio_queue);
@@ -708,12 +784,14 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
             size_t challenge_length = strlen(challenge);
             if (challenge_length <= 128) {
                 char r_challange[challenge_length + 5];
-                base64_pad(challenge, challenge_length, r_challange, challenge_length + 5);
-                _raop_session_get_apple_response(rs, r_challange, strlen(r_challange), a_res, &a_res_size);
-                
-                if (a_res_size > 0 && a_res_size < sizeof(a_res)) {
-                    a_res[a_res_size] = '\0';
-                    web_headers_set_value(response_headers, "Apple-Response", "%s", a_res);
+                size_t padded_length = base64_pad(challenge, challenge_length, r_challange, challenge_length + 5);
+                if (padded_length > 0) {
+                    _raop_session_get_apple_response(rs, r_challange, padded_length, a_res, &a_res_size);
+                    
+                    if (a_res_size > 0 && a_res_size < sizeof(a_res)) {
+                        a_res[a_res_size] = '\0';
+                        web_headers_set_value(response_headers, "Apple-Response", "%s", a_res);
+                    }
                 }
             }
             
@@ -744,6 +822,9 @@ void _raop_session_raop_closed_callback(web_server_connection_p connection, void
 struct raop_session_t* raop_session_create(raop_server_p server, web_server_connection_p connection, settings_p settings) {
     
     struct raop_session_t* rs = (struct raop_session_t*)malloc(sizeof(struct raop_session_t));
+    if (rs == NULL)
+        return NULL;
+    
     bzero(rs, sizeof(struct raop_session_t));
     
     rs->server = server;
@@ -754,19 +835,29 @@ struct raop_session_t* raop_session_create(raop_server_p server, web_server_conn
     const char* password = settings_get_password(settings);
     if (password != NULL && strlen(password) > 0) {
         rs->password = (char*)malloc(strlen(password) + 1);
-        strcpy(rs->password, password);
+        if (rs->password != NULL)
+            strcpy(rs->password, password);
+    }
+    
+    rs->mutex = mutex_create();
+    if (rs->mutex == NULL) {
+        if (rs->password != NULL)
+            free(rs->password);
+        free(rs);
+        return NULL;
     }
     
     web_server_connection_set_request_callback(rs->raop_connection, _raop_session_raop_connection_request_callback, rs);
     web_server_connection_set_closed_callback(rs->raop_connection, _raop_session_raop_closed_callback, rs);
-    
-    rs->mutex = mutex_create();
     
     return rs;
     
 }
 
 void raop_session_destroy(struct raop_session_t* rs) {
+    
+    if (rs == NULL)
+        return;
     
     mutex_lock(rs->mutex);
     
@@ -792,6 +883,9 @@ void raop_session_destroy(struct raop_session_t* rs) {
 
 void raop_session_start(struct raop_session_t* rs) {
     
+    if (rs == NULL)
+        return;
+    
     mutex_lock(rs->mutex);
     
     if (!rs->is_running)
@@ -802,6 +896,9 @@ void raop_session_start(struct raop_session_t* rs) {
 }
 
 void raop_session_stop(struct raop_session_t* rs) {
+    
+    if (rs == NULL)
+        return;
     
     bool stopped = false;
     
@@ -913,6 +1010,9 @@ void raop_session_set_ended_callback(struct raop_session_t* rs, raop_session_end
 
 bool raop_session_is_recording(struct raop_session_t* rs) {
     
+    if (rs == NULL)
+        return false;
+    
     mutex_lock(rs->mutex);
     bool ret = (rs->rtp_session != NULL);
     mutex_unlock(rs->mutex);
@@ -923,12 +1023,15 @@ bool raop_session_is_recording(struct raop_session_t* rs) {
 
 dacp_client_p raop_session_get_dacp_client(struct raop_session_t* rs) {
     
-    return rs->dacp_client;
+    return rs != NULL ? rs->dacp_client : NULL;
     
 }
 
 //Sets the session volume level. The valid range is 0.0 to 1.0.
 void raop_session_set_volume(struct raop_session_t* rs, float volume) {
+    
+    if (rs == NULL)
+        return;
     
     mutex_lock(rs->mutex);
     
