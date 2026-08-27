@@ -107,6 +107,9 @@ struct web_server_connection_t* web_server_connection_create(socket_p socket, we
 
 void web_server_connection_destroy(struct web_server_connection_t* wc) {
     
+    web_server_connection_closed_callback closed_callback = NULL;
+    void* closed_callback_ctx = NULL;
+    
     mutex_lock(wc->mutex);
     
     if (wc->destroying) {
@@ -122,9 +125,22 @@ void web_server_connection_destroy(struct web_server_connection_t* wc) {
     
     wc->destroying = true;
     
+    /* A destroy that did not originate from web_server_connection_close()
+       represents the underlying socket disappearing. Notify the owner once,
+       but mark the connection disconnected first so the callback can safely
+       call web_server_connection_close() without recursing. */
+    if (wc->is_connected) {
+        wc->is_connected = false;
+        closed_callback = wc->closed_callback;
+        closed_callback_ctx = wc->closed_callback_ctx;
+    }
+    
     mutex_unlock(wc->mutex);
     
-    web_server_connection_close(wc);
+    if (closed_callback != NULL)
+        closed_callback(wc, closed_callback_ctx);
+    
+    socket_close(wc->socket);
     
     mutex_destroy(wc->mutex);
     
@@ -201,8 +217,6 @@ void web_server_connection_take_off(struct web_server_connection_t* wc) {
 
 void web_server_connection_close(struct web_server_connection_t* wc) {
     
-    web_server_connection_closed_callback closed_callback = NULL;
-    void* closed_callback_ctx = NULL;
     bool should_close = false;
     
     mutex_lock(wc->mutex);
@@ -214,8 +228,6 @@ void web_server_connection_close(struct web_server_connection_t* wc) {
         wc->is_connected = false;
         wc->close_in_progress = true;
         should_close = true;
-        closed_callback = wc->closed_callback;
-        closed_callback_ctx = wc->closed_callback_ctx;
         
     }
     
@@ -225,12 +237,10 @@ void web_server_connection_close(struct web_server_connection_t* wc) {
         return;
     
     /* socket_close synchronously invokes the server's socket-closed callback.
-       Keep this connection alive until that callback and our own close callback
-       have both returned. */
+       An explicit close is already owned by the caller, so do not invoke the
+       connection closed callback here. The socket-closed path will defer
+       destruction until this function returns. */
     socket_close(wc->socket);
-    
-    if (closed_callback != NULL)
-        closed_callback(wc, closed_callback_ctx);
     
     mutex_lock(wc->mutex);
     
