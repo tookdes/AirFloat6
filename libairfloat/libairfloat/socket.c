@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <errno.h>
 #include <string.h>
 
@@ -73,6 +74,36 @@ struct socket_t {
     struct sockaddr* local_end_point;
     struct sockaddr* remote_end_point;
 };
+
+void _socket_enable_tcp_keepalive(int socket_fd) {
+    
+    if (socket_fd < 0)
+        return;
+    
+    int enabled = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+    
+    /* Keep paused RAOP sessions alive while allowing dead Wi-Fi peers to be
+       detected promptly. Darwin exposes the idle time as TCP_KEEPALIVE. */
+#if defined(TCP_KEEPALIVE)
+    int keepalive_idle = 30;
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepalive_idle, sizeof(keepalive_idle));
+#elif defined(TCP_KEEPIDLE)
+    int keepalive_idle = 30;
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepalive_idle, sizeof(keepalive_idle));
+#endif
+    
+#if defined(TCP_KEEPINTVL)
+    int keepalive_interval = 10;
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepalive_interval, sizeof(keepalive_interval));
+#endif
+    
+#if defined(TCP_KEEPCNT)
+    int keepalive_count = 3;
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepalive_count, sizeof(keepalive_count));
+#endif
+    
+}
 
 void _socket_set_loop_name(struct socket_t* s, const char* name) {
     
@@ -130,6 +161,8 @@ void _socket_accept_loop(void* ctx) {
         mutex_lock(s->mutex);
         
         if (new_socket_fd >= 0) {
+            
+            _socket_enable_tcp_keepalive(new_socket_fd);
             
             struct socket_t* new_socket = (struct socket_t*)malloc(sizeof(struct socket_t));
             bzero(new_socket, sizeof(struct socket_t));
@@ -352,6 +385,9 @@ bool socket_bind(struct socket_t* s, struct sockaddr* end_point) {
             return false;
         }
         
+        if (!s->is_udp)
+            _socket_enable_tcp_keepalive(s->socket);
+        
         if (sockaddr_is_ipv6(ep)) {
             int32_t on = 1;
             setsockopt(s->socket, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
@@ -376,8 +412,11 @@ void socket_connect(struct socket_t* s, struct sockaddr* end_point) {
     
     if (!s->is_connected && !s->is_udp) {
         
-        if (s->socket <= 0)
+        if (s->socket <= 0) {
             s->socket = socket(end_point->sa_family, SOCK_STREAM, IPPROTO_TCP);
+            if (s->socket > 0)
+                _socket_enable_tcp_keepalive(s->socket);
+        }
         
         if (s->socket <= 0)
             log_message(LOG_ERROR, "Socket creation error: %s", strerror(errno));
