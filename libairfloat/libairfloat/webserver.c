@@ -165,8 +165,14 @@ bool _web_server_socket_accept_callback(socket_p socket, socket_p new_socket, vo
     }
     
     mutex_lock(ws->mutex);
+    if (!ws->is_running) {
+        mutex_unlock(ws->mutex);
+        web_server_connection_destroy(new_web_connection);
+        return false;
+    }
+    
     struct web_server_connection_t* connections = (struct web_server_connection_t*)realloc(ws->connections, sizeof(struct web_server_connection_t) * (ws->connection_count + 1));
-    if (connections == NULL || !ws->is_running) {
+    if (connections == NULL) {
         mutex_unlock(ws->mutex);
         web_server_connection_destroy(new_web_connection);
         return false;
@@ -314,9 +320,10 @@ struct sockaddr* web_server_get_local_end_point(struct web_server_t* ws, sockadd
         socket = ws->socket_ipv4;
     else if (socket_type == sockaddr_type_inet_6 && (ws->socket_types & sockaddr_type_inet_6) != 0)
         socket = ws->socket_ipv6;
-    mutex_unlock(ws->mutex);
     
-    return socket != NULL ? socket_get_local_end_point(socket) : NULL;
+    struct sockaddr* end_point = socket != NULL ? socket_get_local_end_point(socket) : NULL;
+    mutex_unlock(ws->mutex);
+    return end_point;
 }
 
 void web_server_set_accept_callback(struct web_server_t* ws, web_server_accept_callback accept_callback, void* ctx) {
