@@ -31,35 +31,68 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "endian.h"
 #include "alac_format.h"
 
-struct alac_magic_cookie_t alac_format_parse(const char* rtp_fmtp) {
+static bool _alac_format_parse_values(const char* rtp_fmtp, uint32_t values[11]) {
     
-    size_t fmtp_len = strlen(rtp_fmtp);
-    char fmtp_s[fmtp_len + 1];
-    strcpy(fmtp_s, rtp_fmtp);
+    if (rtp_fmtp == NULL || values == NULL)
+        return false;
     
-    uint32_t fmtp[11];
-    uint32_t fmtp_c = 0;
-    bzero(fmtp, sizeof(uint32_t) * 11);
-    
-    char* read_pos = fmtp_s;
-    
-    for (uint32_t i = 0 ; true ; i++) {
-        if (fmtp_s[i] == ' ') {
-            fmtp_s[i] = '\0';
-            fmtp[fmtp_c++] = atoi(read_pos);
-            read_pos = &fmtp_s[i + 1];
-        } else if (fmtp_s[i] == '\0') {
-            fmtp[fmtp_c++] = atoi(read_pos);
-            break;
+    const char* pos = rtp_fmtp;
+    for (uint32_t i = 0 ; i < 11 ; i++) {
+        while (*pos != '\0' && isspace((unsigned char)*pos))
+            pos++;
+        
+        if (*pos == '\0' || *pos == '-')
+            return false;
+        
+        errno = 0;
+        char* end = NULL;
+        unsigned long value = strtoul(pos, &end, 10);
+        if (errno == ERANGE || end == pos || value > UINT32_MAX)
+            return false;
+        
+        values[i] = (uint32_t)value;
+        pos = end;
+        
+        if (i < 10) {
+            if (*pos == '\0' || !isspace((unsigned char)*pos))
+                return false;
         }
     }
     
+    while (*pos != '\0' && isspace((unsigned char)*pos))
+        pos++;
+    if (*pos != '\0')
+        return false;
+    
+    /* Keep validation broad enough for legacy ALAC variants while rejecting
+       values that would overflow buffers or cannot fit the cookie fields. */
+    if (values[0] == 0 || values[0] > 65536 ||
+        values[1] > UINT8_MAX ||
+        values[2] < 8 || values[2] > 32 || (values[2] % 8) != 0 ||
+        values[3] > UINT8_MAX || values[4] > UINT8_MAX || values[5] > UINT8_MAX ||
+        values[6] == 0 || values[6] > 8 ||
+        values[7] > UINT16_MAX ||
+        values[10] < 8000 || values[10] > 192000)
+        return false;
+    
+    return true;
+}
+
+struct alac_magic_cookie_t alac_format_parse(const char* rtp_fmtp) {
+    
     struct alac_magic_cookie_t cookie;
     bzero(&cookie, sizeof(struct alac_magic_cookie_t));
+    
+    uint32_t fmtp[11];
+    if (!_alac_format_parse_values(rtp_fmtp, fmtp))
+        return cookie;
     
     cookie.format_atom.atom_size = mtbl(12);
     cookie.format_atom.channel_layout_info_id = mtbl('frma');
@@ -68,12 +101,12 @@ struct alac_magic_cookie_t alac_format_parse(const char* rtp_fmtp) {
     cookie.alac_specific_info.id = mtbl('alac');
     cookie.alac_specific_info.version_flag = 0;
     cookie.alac_specific_info.config.frame_length = mtbl(fmtp[0]);
-    cookie.alac_specific_info.config.compatible_version = fmtp[1];
-    cookie.alac_specific_info.config.bit_depth = fmtp[2];
-    cookie.alac_specific_info.config.pb = fmtp[3];
-    cookie.alac_specific_info.config.mb = fmtp[4];
-    cookie.alac_specific_info.config.kb = fmtp[5];
-    cookie.alac_specific_info.config.num_channels = fmtp[6];
+    cookie.alac_specific_info.config.compatible_version = (uint8_t)fmtp[1];
+    cookie.alac_specific_info.config.bit_depth = (uint8_t)fmtp[2];
+    cookie.alac_specific_info.config.pb = (uint8_t)fmtp[3];
+    cookie.alac_specific_info.config.mb = (uint8_t)fmtp[4];
+    cookie.alac_specific_info.config.kb = (uint8_t)fmtp[5];
+    cookie.alac_specific_info.config.num_channels = (uint8_t)fmtp[6];
     cookie.alac_specific_info.config.max_run = mtbs((uint16_t)fmtp[7]);
     cookie.alac_specific_info.config.max_frame_bytes = mtbl(fmtp[8]);
     cookie.alac_specific_info.config.avg_bit_rate = mtbl(fmtp[9]);
@@ -82,5 +115,4 @@ struct alac_magic_cookie_t alac_format_parse(const char* rtp_fmtp) {
     cookie.terminator_atom.channel_layout_info_id = 0;
     
     return cookie;
-    
 }
