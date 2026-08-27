@@ -32,6 +32,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CFNetwork/CFNetwork.h>
@@ -45,122 +46,200 @@
 
 #include "zeroconf.h"
 
+static bool _zeroconf_cfstring_to_cstring(CFStringRef string, char* buffer, size_t buffer_size) {
+    if (string == NULL || buffer == NULL || buffer_size == 0)
+        return false;
+    buffer[0] = '\0';
+    return CFStringGetCString(string, buffer, (CFIndex)buffer_size, kCFStringEncodingUTF8);
+}
+
 struct zeroconf_raop_ad_t {
     CFNetServiceRef service;
     CFRunLoopRef run_loop;
     thread_p thread;
     mutex_p mutex;
     condition_p condition;
+    bool run_loop_ready;
     uint16_t port;
 };
 
 void zeroconf_raop_ad_destroy(struct zeroconf_raop_ad_t* za);
 
 void _zeroconf_raop_ad_callback(CFNetServiceRef theService, CFStreamError* error, void* info) {
+    struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)info;
+    if (za == NULL)
+        return;
     
-    struct zeroconf_raop_ad_t* b = (struct zeroconf_raop_ad_t*)info;
-    
-    if (error->error == 0)
-        log_message(LOG_INFO, "Zeroconf advertising started on port %d", b->port);
+    if (error == NULL || error->error == 0)
+        log_message(LOG_INFO, "Zeroconf advertising started on port %d", za->port);
     else
         log_message(LOG_ERROR, "Could not start Zeroconf advertisement.");
-    
 }
 
 void _zeroconf_raop_ad_run_loop_ready(CFRunLoopTimerRef timer, void *info) {
+    struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)info;
+    if (za == NULL)
+        return;
     
-    struct zeroconf_raop_ad_t* b = (struct zeroconf_raop_ad_t*)info;
+    mutex_lock(za->mutex);
+    za->run_loop_ready = true;
+    condition_signal(za->condition);
+    mutex_unlock(za->mutex);
     
     log_message(LOG_INFO, "Run loop ready");
-    condition_signal(b->condition);
-    
 }
 
 void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
-    
     thread_set_name("RAOP Zeroconf advertising run loop");
     
     struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)ctx;
+    if (za == NULL)
+        return;
+    
+    CFRunLoopRef run_loop = CFRunLoopGetCurrent();
     
     CFNetServiceClientContext context = { 0, za, NULL, NULL, NULL };
-    
-    CFNetServiceSetClient(za->service, _zeroconf_raop_ad_callback, &context);    
-    CFNetServiceScheduleWithRunLoop(za->service, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
+    CFNetServiceSetClient(za->service, _zeroconf_raop_ad_callback, &context);
+    CFNetServiceScheduleWithRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
     CFNetServiceRegisterWithOptions(za->service, kCFNetServiceFlagNoAutoRename, NULL);
     
-    za->run_loop = CFRunLoopGetCurrent();
+    mutex_lock(za->mutex);
+    za->run_loop = run_loop;
+    mutex_unlock(za->mutex);
     
     CFRunLoopTimerContext timer_context = { 0, za, NULL, NULL, NULL };
-    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .2, 0, 0, 0, _zeroconf_raop_ad_run_loop_ready, &timer_context);
-    CFRunLoopAddTimer(za->run_loop, timer, kCFRunLoopCommonModes);
-    CFRelease(timer);
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .02, 0, 0, 0, _zeroconf_raop_ad_run_loop_ready, &timer_context);
+    if (timer != NULL) {
+        CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
+        CFRelease(timer);
+    } else {
+        mutex_lock(za->mutex);
+        za->run_loop_ready = true;
+        condition_signal(za->condition);
+        mutex_unlock(za->mutex);
+    }
     
     CFRunLoopRun();
     
-    CFNetServiceUnscheduleFromRunLoop(za->service, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
+    CFNetServiceUnscheduleFromRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
     CFNetServiceSetClient(za->service, NULL, NULL);
     CFNetServiceCancel(za->service);
     
+    mutex_lock(za->mutex);
+    za->run_loop = NULL;
+    mutex_unlock(za->mutex);
 }
 
 struct zeroconf_raop_ad_t* zeroconf_raop_ad_create(uint16_t port, const char *name) {
-    
     struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)malloc(sizeof(struct zeroconf_raop_ad_t));
-        
-    CFStringRef service_name = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingASCII);
-    uint64_t hardware_id = hardware_identifier();
+    if (za == NULL)
+        return NULL;
+    bzero(za, sizeof(struct zeroconf_raop_ad_t));
     
+    const char* service_name_c = (name != NULL && name[0] != '\0') ? name : "AirFloat";
+    CFStringRef service_name = CFStringCreateWithCString(kCFAllocatorDefault, service_name_c, kCFStringEncodingUTF8);
+    if (service_name == NULL) {
+        free(za);
+        return NULL;
+    }
+    
+    uint64_t hardware_id = hardware_identifier();
     uint8_t* hardware_chars = (uint8_t*)&hardware_id;
     
     CFStringRef hardware_identifier = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("%02X%02X%02X%02X%02X%02X"), hardware_chars[2], hardware_chars[3], hardware_chars[4], hardware_chars[5], hardware_chars[6], hardware_chars[7]);
+    CFStringRef combined_name = NULL;
+    if (hardware_identifier != NULL)
+        combined_name = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("%@@%@"), hardware_identifier, service_name);
     
-    CFStringRef combined_name = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("%@@%@"), hardware_identifier, service_name);
+    if (hardware_identifier == NULL || combined_name == NULL) {
+        if (combined_name != NULL)
+            CFRelease(combined_name);
+        if (hardware_identifier != NULL)
+            CFRelease(hardware_identifier);
+        CFRelease(service_name);
+        free(za);
+        return NULL;
+    }
     
     za->service = CFNetServiceCreate(kCFAllocatorDefault, CFSTR(""), CFSTR("_raop._tcp"), combined_name, port);
     za->port = port;
+    
+    CFRelease(combined_name);
+    CFRelease(hardware_identifier);
+    CFRelease(service_name);
+    
+    if (za->service == NULL) {
+        free(za);
+        return NULL;
+    }
     
     CFStringRef keys[16] = { CFSTR("txtvers"), CFSTR("et"), CFSTR("ek"), CFSTR("ss"), CFSTR("sr"), CFSTR("tp"), CFSTR("cn"), CFSTR("da"), CFSTR("sf"), CFSTR("vn"), CFSTR("md"), CFSTR("vs"), CFSTR("sv"), CFSTR("sm"), CFSTR("ch"), CFSTR("sr") };
     CFStringRef values[16] = { CFSTR("1"), CFSTR("0,1"), CFSTR("1"), CFSTR("16"), CFSTR("44100"), CFSTR("TCP,UDP"), CFSTR("1"), CFSTR("true"), CFSTR("0x4"), CFSTR("65537"), CFSTR("0,1,2"), CFSTR("104.29"), CFSTR("false"), CFSTR("false"), CFSTR("2"), CFSTR("44100") };
     
     CFDictionaryRef txt_dictionary = CFDictionaryCreate(kCFAllocatorDefault, (const void**)&keys, (const void**)&values, 16, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFDataRef txt_data = CFNetServiceCreateTXTDataWithDictionary(kCFAllocatorDefault, txt_dictionary);
-
-    CFNetServiceSetTXTData(za->service, txt_data);
+    CFDataRef txt_data = NULL;
+    if (txt_dictionary != NULL)
+        txt_data = CFNetServiceCreateTXTDataWithDictionary(kCFAllocatorDefault, txt_dictionary);
+    
+    if (txt_data != NULL)
+        CFNetServiceSetTXTData(za->service, txt_data);
+    
+    if (txt_data != NULL)
+        CFRelease(txt_data);
+    if (txt_dictionary != NULL)
+        CFRelease(txt_dictionary);
     
     za->mutex = mutex_create();
     za->condition = condition_create();
+    if (za->mutex == NULL || za->condition == NULL) {
+        if (za->condition != NULL)
+            condition_destroy(za->condition);
+        if (za->mutex != NULL)
+            mutex_destroy(za->mutex);
+        CFRelease(za->service);
+        free(za);
+        return NULL;
+    }
     
     mutex_lock(za->mutex);
     za->thread = thread_create_a(_zeroconf_raop_ad_run_loop_thread, za);
-    condition_wait(za->condition, za->mutex);
+    if (za->thread == NULL) {
+        mutex_unlock(za->mutex);
+        condition_destroy(za->condition);
+        mutex_destroy(za->mutex);
+        CFRelease(za->service);
+        free(za);
+        return NULL;
+    }
+    while (!za->run_loop_ready)
+        condition_wait(za->condition, za->mutex);
     mutex_unlock(za->mutex);
     
     log_message(LOG_INFO, "Zeroconf configured");
-    
-    CFRelease(txt_data);
-    CFRelease(txt_dictionary);
-    CFRelease(combined_name);
-    CFRelease(hardware_identifier);
-    CFRelease(service_name);
-    
     return za;
-    
 }
 
 void zeroconf_raop_ad_destroy(struct zeroconf_raop_ad_t* za) {
+    if (za == NULL)
+        return;
     
-    CFRunLoopStop(za->run_loop);
+    mutex_lock(za->mutex);
+    CFRunLoopRef run_loop = za->run_loop;
+    mutex_unlock(za->mutex);
+    
+    if (run_loop != NULL)
+        CFRunLoopStop(run_loop);
+    
+    thread_destroy(za->thread);
+    za->thread = NULL;
     
     condition_destroy(za->condition);
     mutex_destroy(za->mutex);
-    thread_join(za->thread);
     
-    CFRelease(za->service);
-    
-    thread_destroy(za->thread);
+    if (za->service != NULL)
+        CFRelease(za->service);
     
     free(za);
-    
 }
 
 struct zeroconf_dacp_discover_t {
@@ -170,151 +249,245 @@ struct zeroconf_dacp_discover_t {
     CFRunLoopRef run_loop;
     thread_p thread;
     mutex_p mutex;
+    condition_p condition;
+    bool run_loop_ready;
     zeroconf_dacp_discover_service_found_callback service_found_callback;
     void* service_found_callback_ctx;
 };
 
 void _zeroconf_dacp_discover_resolve_callback(CFNetServiceRef service, CFStreamError* error, void* info) {
-    
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)info;
+    if (zd == NULL || service == NULL || (error != NULL && error->error != 0))
+        return;
     
     CFArrayRef addresses = CFNetServiceGetAddressing(service);
+    if (addresses == NULL)
+        return;
     
-    if (addresses != NULL && zd->service_found_callback != NULL) {
-        
-        uint32_t addresses_count = (uint32_t)CFArrayGetCount(addresses);
-        struct sockaddr* end_points[addresses_count];
-        
-        for (uint32_t i = 0 ; i < addresses_count ; i++) {
-            CFDataRef sockaddr_data = (CFDataRef)CFArrayGetValueAtIndex(addresses, i);
-            struct sockaddr* end_point = (struct sockaddr*)CFDataGetBytePtr(sockaddr_data);
-            end_points[i] = sockaddr_copy(end_point);
-        }
-        
-        zd->service_found_callback(zd, CFStringGetCStringPtr(CFNetServiceGetName(service), kCFStringEncodingMacRoman), end_points, addresses_count, zd->service_found_callback_ctx);
-        
-        for (uint32_t i = 0 ; i < addresses_count ; i++)
-            sockaddr_destroy(end_points[i]);
-        
+    CFIndex cf_addresses_count = CFArrayGetCount(addresses);
+    if (cf_addresses_count <= 0 || cf_addresses_count > UINT32_MAX)
+        return;
+    
+    uint32_t addresses_count = (uint32_t)cf_addresses_count;
+    struct sockaddr** end_points = (struct sockaddr**)calloc(addresses_count, sizeof(struct sockaddr*));
+    if (end_points == NULL)
+        return;
+    
+    uint32_t valid_count = 0;
+    for (uint32_t i = 0 ; i < addresses_count ; i++) {
+        CFDataRef sockaddr_data = (CFDataRef)CFArrayGetValueAtIndex(addresses, i);
+        if (sockaddr_data == NULL || CFDataGetLength(sockaddr_data) < (CFIndex)sizeof(struct sockaddr))
+            continue;
+        struct sockaddr* end_point = (struct sockaddr*)CFDataGetBytePtr(sockaddr_data);
+        struct sockaddr* copy = sockaddr_copy(end_point);
+        if (copy != NULL)
+            end_points[valid_count++] = copy;
     }
     
-    log_message(LOG_INFO, "Found DACP Service: %s", CFStringGetCStringPtr(CFNetServiceGetName(service), kCFStringEncodingMacRoman));
+    char service_name[256];
+    bool has_name = _zeroconf_cfstring_to_cstring(CFNetServiceGetName(service), service_name, sizeof(service_name));
     
+    zeroconf_dacp_discover_service_found_callback callback = zd->service_found_callback;
+    void* callback_ctx = zd->service_found_callback_ctx;
+    if (valid_count > 0 && has_name && callback != NULL)
+        callback(zd, service_name, end_points, valid_count, callback_ctx);
+    
+    for (uint32_t i = 0 ; i < valid_count ; i++)
+        sockaddr_destroy(end_points[i]);
+    free(end_points);
+    
+    if (has_name)
+        log_message(LOG_INFO, "Found DACP Service: %s", service_name);
 }
 
 void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFOptionFlags flags, CFTypeRef domainOrService, CFStreamError* error, void* info) {
-    
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)info;
+    if (zd == NULL || browser == NULL || domainOrService == NULL || (error != NULL && error->error != 0))
+        return;
+    
+    if ((flags & kCFNetServiceFlagRemove) != 0)
+        return;
     
     if (browser == zd->domain_browser) {
-        
-        mutex_lock(zd->mutex);
-        
-        zd->service_browsers = (CFNetServiceBrowserRef*)realloc(zd->service_browsers, sizeof(CFNetServiceBrowserRef) * (zd->service_browsers_count + 1));
-        CFNetServiceBrowserRef* service_browser = &zd->service_browsers[zd->service_browsers_count++];
+        if (CFGetTypeID(domainOrService) != CFStringGetTypeID())
+            return;
         
         CFNetServiceClientContext context = { 0, zd, NULL, NULL, NULL };
+        CFNetServiceBrowserRef service_browser = CFNetServiceBrowserCreate(kCFAllocatorDefault, _zeroconf_dacp_discover_browse_callback, &context);
+        if (service_browser == NULL)
+            return;
         
-        *service_browser = CFNetServiceBrowserCreate(kCFAllocatorDefault, _zeroconf_dacp_discover_browse_callback, &context);
-        
-        CFNetServiceBrowserScheduleWithRunLoop(*service_browser, zd->run_loop, kCFRunLoopCommonModes);
-        CFNetServiceBrowserSearchForServices(*service_browser, domainOrService, CFSTR("_dacp._tcp."), NULL);
-        
+        mutex_lock(zd->mutex);
+        CFNetServiceBrowserRef* browsers = (CFNetServiceBrowserRef*)realloc(zd->service_browsers, sizeof(CFNetServiceBrowserRef) * (zd->service_browsers_count + 1));
+        if (browsers == NULL) {
+            mutex_unlock(zd->mutex);
+            CFRelease(service_browser);
+            return;
+        }
+        zd->service_browsers = browsers;
+        zd->service_browsers[zd->service_browsers_count++] = service_browser;
+        CFRunLoopRef run_loop = zd->run_loop;
         mutex_unlock(zd->mutex);
         
-        log_message(LOG_INFO, "Domain found: %s", CFStringGetCStringPtr(domainOrService, kCFStringEncodingMacRoman));
+        if (run_loop != NULL) {
+            CFNetServiceBrowserScheduleWithRunLoop(service_browser, run_loop, kCFRunLoopCommonModes);
+            CFNetServiceBrowserSearchForServices(service_browser, (CFStringRef)domainOrService, CFSTR("_dacp._tcp."), NULL);
+        }
         
-    } else if (CFNetServiceGetTypeID() == CFGetTypeID(domainOrService)) {
+        char domain_name[256];
+        if (_zeroconf_cfstring_to_cstring((CFStringRef)domainOrService, domain_name, sizeof(domain_name)))
+            log_message(LOG_INFO, "Domain found: %s", domain_name);
         
+    } else if (CFGetTypeID(domainOrService) == CFNetServiceGetTypeID()) {
         CFNetServiceRef service = (CFNetServiceRef)domainOrService;
-        
         CFArrayRef addresses = CFNetServiceGetAddressing(service);
         
         if (addresses == NULL) {
+            CFNetServiceClientContext context = { 0, zd, NULL, NULL, NULL };
+            CFNetServiceSetClient(service, _zeroconf_dacp_discover_resolve_callback, &context);
             
-            CFNetServiceClientContext content = { 0, zd, NULL, NULL, NULL };
+            mutex_lock(zd->mutex);
+            CFRunLoopRef run_loop = zd->run_loop;
+            mutex_unlock(zd->mutex);
             
-            CFNetServiceSetClient(service, _zeroconf_dacp_discover_resolve_callback, &content);
-            CFNetServiceScheduleWithRunLoop(service, zd->run_loop, kCFRunLoopCommonModes);
-            CFNetServiceResolveWithTimeout(service, 30.0, NULL);
-            
+            if (run_loop != NULL) {
+                CFNetServiceScheduleWithRunLoop(service, run_loop, kCFRunLoopCommonModes);
+                CFNetServiceResolveWithTimeout(service, 30.0, NULL);
+            }
         } else
             _zeroconf_dacp_discover_resolve_callback(service, NULL, zd);
-        
     }
+}
+
+void _zeroconf_dacp_discover_run_loop_ready(CFRunLoopTimerRef timer, void *info) {
+    struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)info;
+    if (zd == NULL)
+        return;
     
+    mutex_lock(zd->mutex);
+    zd->run_loop_ready = true;
+    condition_signal(zd->condition);
+    mutex_unlock(zd->mutex);
 }
 
 void _zeroconf_dacp_discover_run_loop_thread(void* ctx) {
-    
     thread_set_name("DACP Zeroconf discover run loop");
     
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)ctx;
+    if (zd == NULL)
+        return;
     
-    zd->run_loop = CFRunLoopGetCurrent();
+    CFRunLoopRef run_loop = CFRunLoopGetCurrent();
     
-    CFNetServiceBrowserScheduleWithRunLoop(zd->domain_browser, zd->run_loop, kCFRunLoopCommonModes);
+    mutex_lock(zd->mutex);
+    zd->run_loop = run_loop;
+    mutex_unlock(zd->mutex);
+    
+    CFNetServiceBrowserScheduleWithRunLoop(zd->domain_browser, run_loop, kCFRunLoopCommonModes);
     CFNetServiceBrowserSearchForDomains(zd->domain_browser, FALSE, NULL);
+    
+    CFRunLoopTimerContext timer_context = { 0, zd, NULL, NULL, NULL };
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .02, 0, 0, 0, _zeroconf_dacp_discover_run_loop_ready, &timer_context);
+    if (timer != NULL) {
+        CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
+        CFRelease(timer);
+    } else {
+        mutex_lock(zd->mutex);
+        zd->run_loop_ready = true;
+        condition_signal(zd->condition);
+        mutex_unlock(zd->mutex);
+    }
     
     CFRunLoopRun();
     
-    CFNetServiceBrowserUnscheduleFromRunLoop(zd->domain_browser, zd->run_loop, kCFRunLoopCommonModes);
+    CFNetServiceBrowserUnscheduleFromRunLoop(zd->domain_browser, run_loop, kCFRunLoopCommonModes);
     CFNetServiceBrowserInvalidate(zd->domain_browser);
     
+    mutex_lock(zd->mutex);
+    for (uint32_t i = 0 ; i < zd->service_browsers_count ; i++) {
+        if (zd->service_browsers[i] != NULL) {
+            CFNetServiceBrowserUnscheduleFromRunLoop(zd->service_browsers[i], run_loop, kCFRunLoopCommonModes);
+            CFNetServiceBrowserInvalidate(zd->service_browsers[i]);
+            CFRelease(zd->service_browsers[i]);
+        }
+    }
+    free(zd->service_browsers);
+    zd->service_browsers = NULL;
+    zd->service_browsers_count = 0;
     zd->run_loop = NULL;
-    
+    mutex_unlock(zd->mutex);
 }
 
 struct zeroconf_dacp_discover_t* zeroconf_dacp_discover_create() {
-    
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)malloc(sizeof(struct zeroconf_dacp_discover_t));
+    if (zd == NULL)
+        return NULL;
     bzero(zd, sizeof(struct zeroconf_dacp_discover_t));
     
     CFNetServiceClientContext context = { 0, zd, NULL, NULL, NULL };
-    
     zd->domain_browser = CFNetServiceBrowserCreate(kCFAllocatorDefault, _zeroconf_dacp_discover_browse_callback, &context);
     zd->mutex = mutex_create();
+    zd->condition = condition_create();
+    
+    if (zd->domain_browser == NULL || zd->mutex == NULL || zd->condition == NULL) {
+        if (zd->condition != NULL)
+            condition_destroy(zd->condition);
+        if (zd->mutex != NULL)
+            mutex_destroy(zd->mutex);
+        if (zd->domain_browser != NULL)
+            CFRelease(zd->domain_browser);
+        free(zd);
+        return NULL;
+    }
+    
+    mutex_lock(zd->mutex);
     zd->thread = thread_create_a(_zeroconf_dacp_discover_run_loop_thread, zd);
+    if (zd->thread == NULL) {
+        mutex_unlock(zd->mutex);
+        condition_destroy(zd->condition);
+        mutex_destroy(zd->mutex);
+        CFRelease(zd->domain_browser);
+        free(zd);
+        return NULL;
+    }
+    while (!zd->run_loop_ready)
+        condition_wait(zd->condition, zd->mutex);
+    mutex_unlock(zd->mutex);
     
     return zd;
-    
 }
 
 void zeroconf_dacp_discover_destroy(struct zeroconf_dacp_discover_t* zd) {
+    if (zd == NULL)
+        return;
     
     mutex_lock(zd->mutex);
-    
-    for (uint32_t i = 0 ; i < zd->service_browsers_count ; i++) {
-        CFNetServiceBrowserUnscheduleFromRunLoop(zd->service_browsers[i], zd->run_loop, kCFRunLoopCommonModes);
-        CFNetServiceBrowserInvalidate(zd->service_browsers[i]);
-        CFRelease(zd->service_browsers[i]);
-    }
-        
-    free(zd->service_browsers);
-    
-    zd->service_browsers_count = 0;
-    
+    CFRunLoopRef run_loop = zd->run_loop;
     mutex_unlock(zd->mutex);
     
-    if (zd->run_loop != NULL) {
-        CFRunLoopStop(zd->run_loop);
-        thread_join(zd->thread);
-    }
+    if (run_loop != NULL)
+        CFRunLoopStop(run_loop);
     
     thread_destroy(zd->thread);
+    zd->thread = NULL;
+    
+    condition_destroy(zd->condition);
     mutex_destroy(zd->mutex);
     
-    CFRelease(zd->domain_browser);
+    if (zd->domain_browser != NULL)
+        CFRelease(zd->domain_browser);
     
     free(zd);
-    
 }
 
 void zeroconf_dacp_discover_set_callback(struct zeroconf_dacp_discover_t* zd, zeroconf_dacp_discover_service_found_callback callback, void* ctx) {
+    if (zd == NULL)
+        return;
     
+    mutex_lock(zd->mutex);
     zd->service_found_callback = callback;
     zd->service_found_callback_ctx = ctx;
-    
+    mutex_unlock(zd->mutex);
 }
 
 #endif
