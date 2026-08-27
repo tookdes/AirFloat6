@@ -244,29 +244,22 @@ void raop_server_set_settings(struct raop_server_t* rs, struct raop_server_setti
     settings_set_name(rs->settings, settings.name);
     settings_set_password(rs->settings, settings.password);
     
-    const char* new_name = settings_get_name(rs->settings);
     if (name_changed && rs->is_running) {
         struct sockaddr* local_end_point = web_server_get_local_end_point(rs->server, sockaddr_type_inet_4);
         uint16_t port = local_end_point != NULL ? sockaddr_get_port(local_end_point) : 0;
         
-        zeroconf_raop_ad_p old_ad = rs->zeroconf_ad;
-        rs->zeroconf_ad = NULL;
-        mutex_unlock(rs->mutex);
-        
-        if (old_ad != NULL)
-            zeroconf_raop_ad_destroy(old_ad);
-        
-        zeroconf_raop_ad_p new_ad = (port != 0 ? zeroconf_raop_ad_create(port, new_name) : NULL);
-        
-        mutex_lock(rs->mutex);
-        if (rs->is_running)
-            rs->zeroconf_ad = new_ad;
-        else if (new_ad != NULL) {
-            mutex_unlock(rs->mutex);
-            zeroconf_raop_ad_destroy(new_ad);
-            return;
+        if (rs->zeroconf_ad != NULL) {
+            zeroconf_raop_ad_destroy(rs->zeroconf_ad);
+            rs->zeroconf_ad = NULL;
         }
+        
+        if (port != 0)
+            rs->zeroconf_ad = zeroconf_raop_ad_create(port, settings_get_name(rs->settings));
+        
+        if (rs->zeroconf_ad == NULL)
+            log_message(LOG_ERROR, "Unable to refresh RAOP advertisement after settings change");
     }
+    
     mutex_unlock(rs->mutex);
 }
 
