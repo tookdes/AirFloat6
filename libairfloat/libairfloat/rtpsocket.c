@@ -31,7 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
+#include <stdbool.h>
 
 #include "rtpsocket.h"
 
@@ -48,178 +48,312 @@ struct rtp_socket_t {
     rtp_socket_data_received_callback received_callback;
     void* received_callback_ctx;
     mutex_p mutex;
+    bool destroying;
 };
+
+void _rtp_socket_socket_closed_callback(socket_p socket, void* ctx);
+ssize_t _rtp_socket_socket_receive_callback(socket_p socket, const void* data, size_t data_size, struct sockaddr* remote_end_point, void* ctx);
 
 struct rtp_socket_t* rtp_socket_create(const char* name, struct sockaddr* allowed_remote_end_point) {
     
     struct rtp_socket_t* rs = (struct rtp_socket_t*)malloc(sizeof(struct rtp_socket_t));
+    if (rs == NULL)
+        return NULL;
     bzero(rs, sizeof(struct rtp_socket_t));
     
-    if (allowed_remote_end_point != NULL)
-        rs->allowed_remote_end_point = sockaddr_copy(allowed_remote_end_point);
+    rs->mutex = mutex_create();
+    if (rs->mutex == NULL) {
+        free(rs);
+        return NULL;
+    }
     
-    if (name) {
+    if (allowed_remote_end_point != NULL) {
+        rs->allowed_remote_end_point = sockaddr_copy(allowed_remote_end_point);
+        if (rs->allowed_remote_end_point == NULL) {
+            mutex_destroy(rs->mutex);
+            free(rs);
+            return NULL;
+        }
+    }
+    
+    if (name != NULL) {
         rs->name = (char*)malloc(strlen(name) + 1);
+        if (rs->name == NULL) {
+            if (rs->allowed_remote_end_point != NULL)
+                sockaddr_destroy(rs->allowed_remote_end_point);
+            mutex_destroy(rs->mutex);
+            free(rs);
+            return NULL;
+        }
         strcpy(rs->name, name);
     }
     
-    rs->mutex = mutex_create();
-    
     return rs;
+}
+
+static struct rtp_socket_info_t* _rtp_socket_store_socket(struct rtp_socket_t* rs, socket_p socket, bool is_data_socket) {
     
+    if (rs == NULL || socket == NULL)
+        return NULL;
+    
+    struct rtp_socket_info_t* info = (struct rtp_socket_info_t*)malloc(sizeof(struct rtp_socket_info_t));
+    if (info == NULL)
+        return NULL;
+    info->socket = socket;
+    info->is_data_socket = is_data_socket;
+    
+    mutex_lock(rs->mutex);
+    if (rs->destroying) {
+        mutex_unlock(rs->mutex);
+        free(info);
+        return NULL;
+    }
+    
+    struct rtp_socket_info_t** sockets = (struct rtp_socket_info_t**)realloc(rs->sockets, sizeof(struct rtp_socket_info_t*) * (rs->sockets_count + 1));
+    if (sockets == NULL) {
+        mutex_unlock(rs->mutex);
+        free(info);
+        return NULL;
+    }
+    
+    rs->sockets = sockets;
+    rs->sockets[rs->sockets_count++] = info;
+    mutex_unlock(rs->mutex);
+    
+    return info;
+}
+
+static struct rtp_socket_info_t* _rtp_socket_detach_socket(struct rtp_socket_t* rs, socket_p socket) {
+    
+    if (rs == NULL || socket == NULL)
+        return NULL;
+    
+    struct rtp_socket_info_t* info = NULL;
+    
+    mutex_lock(rs->mutex);
+    for (uint32_t i = 0 ; i < rs->sockets_count ; i++) {
+        if (rs->sockets[i]->socket == socket) {
+            info = rs->sockets[i];
+            for (uint32_t a = i + 1 ; a < rs->sockets_count ; a++)
+                rs->sockets[a - 1] = rs->sockets[a];
+            rs->sockets_count--;
+            if (rs->sockets_count == 0) {
+                free(rs->sockets);
+                rs->sockets = NULL;
+            }
+            break;
+        }
+    }
+    mutex_unlock(rs->mutex);
+    
+    return info;
+}
+
+static void _rtp_socket_configure_socket(struct rtp_socket_t* rs, struct rtp_socket_info_t* info) {
+    
+    if (rs == NULL || info == NULL || info->socket == NULL)
+        return;
+    
+    /* Install the close callback before starting a receive worker so an
+       immediate peer disconnect cannot leave an untracked socket behind. */
+    socket_set_closed_callback(info->socket, _rtp_socket_socket_closed_callback, rs);
+    if (info->is_data_socket)
+        socket_set_receive_callback(info->socket, _rtp_socket_socket_receive_callback, rs);
 }
 
 void rtp_socket_destroy(struct rtp_socket_t* rs) {
     
+    if (rs == NULL)
+        return;
+    
     mutex_lock(rs->mutex);
-    
-    while (rs->sockets_count > 0) {
+    if (rs->destroying) {
         mutex_unlock(rs->mutex);
-        socket_close(rs->sockets[0]->socket);
-        mutex_lock(rs->mutex);
+        return;
     }
+    rs->destroying = true;
     
-    free(rs->sockets);
-    
+    struct rtp_socket_info_t** sockets = rs->sockets;
+    uint32_t sockets_count = rs->sockets_count;
+    rs->sockets = NULL;
+    rs->sockets_count = 0;
+    rs->received_callback = NULL;
+    rs->received_callback_ctx = NULL;
     mutex_unlock(rs->mutex);
     
-    if (rs->allowed_remote_end_point)
+    /* Detach callbacks before destroying the sockets. socket_destroy waits
+       for their workers, so no callback can reference rs after this loop. */
+    for (uint32_t i = 0 ; i < sockets_count ; i++) {
+        if (sockets[i] != NULL) {
+            if (sockets[i]->socket != NULL) {
+                socket_set_closed_callback(sockets[i]->socket, NULL, NULL);
+                socket_set_receive_callback(sockets[i]->socket, NULL, NULL);
+                socket_destroy(sockets[i]->socket);
+            }
+            free(sockets[i]);
+        }
+    }
+    free(sockets);
+    
+    if (rs->allowed_remote_end_point != NULL)
         sockaddr_destroy(rs->allowed_remote_end_point);
-    
-    if (rs->name)
-        free(rs->name);
-    
+    free(rs->name);
     mutex_destroy(rs->mutex);
-    
     free(rs);
-    
 }
 
 void _rtp_socket_socket_closed_callback(socket_p socket, void* ctx) {
     
     struct rtp_socket_t* rs = (struct rtp_socket_t*)ctx;
+    if (rs == NULL || socket == NULL)
+        return;
     
-    mutex_lock(rs->mutex);
-    
-    for (uint32_t i = 0 ; i < rs->sockets_count ; i++)
-        if (rs->sockets[i]->socket == socket) {
-            
-            socket_destroy(rs->sockets[i]->socket);
-            
-            free(rs->sockets[i]);
-            
-            for (uint32_t a = i + 1 ; a < rs->sockets_count ; a++)
-                rs->sockets[a - 1] = rs->sockets[a];
-            
-            rs->sockets_count--;
-            
-            break;
-            
-        }
-    
-    mutex_unlock(rs->mutex);
-    
+    struct rtp_socket_info_t* info = _rtp_socket_detach_socket(rs, socket);
+    if (info != NULL) {
+        free(info);
+        socket_destroy(socket);
+    }
 }
 
 ssize_t _rtp_socket_socket_receive_callback(socket_p socket, const void* data, size_t data_size, struct sockaddr* remote_end_point, void* ctx) {
     
     struct rtp_socket_t* rs = (struct rtp_socket_t*)ctx;
+    if (rs == NULL || data == NULL)
+        return -1;
     
-    size_t used = data_size;
-    
-    if (sockaddr_equals_host(remote_end_point, rs->allowed_remote_end_point) && rs->received_callback != NULL)
-        used = rs->received_callback(rs, socket, (const char*)data, data_size, rs->received_callback_ctx);
-    
-    return used;
-    
-}
-
-struct rtp_socket_info_t* _rtp_socket_add_socket(struct rtp_socket_t* rs, socket_p socket, bool is_data_socket) {
-    
-    struct rtp_socket_info_t* info = (struct rtp_socket_info_t*)malloc(sizeof(struct rtp_socket_info_t));
-    bzero(info, sizeof(struct rtp_socket_info_t));
-    info->socket = socket;
-    info->is_data_socket = is_data_socket;
-        
-    if (is_data_socket)
-        socket_set_receive_callback(socket, _rtp_socket_socket_receive_callback, rs);
-    
-    socket_set_closed_callback(socket, _rtp_socket_socket_closed_callback, rs);
+    rtp_socket_data_received_callback callback = NULL;
+    void* callback_ctx = NULL;
+    bool allowed = false;
     
     mutex_lock(rs->mutex);
-    
-    rs->sockets = (struct rtp_socket_info_t**)realloc(rs->sockets, sizeof(struct rtp_socket_info_t*) * (rs->sockets_count + 1));
-    rs->sockets[rs->sockets_count] = info;
-    rs->sockets_count++;
-    
+    if (!rs->destroying) {
+        allowed = (rs->allowed_remote_end_point == NULL ||
+                   (remote_end_point != NULL && sockaddr_equals_host(remote_end_point, rs->allowed_remote_end_point)));
+        if (allowed) {
+            callback = rs->received_callback;
+            callback_ctx = rs->received_callback_ctx;
+        }
+    }
     mutex_unlock(rs->mutex);
     
-    return info;
+    if (allowed && callback != NULL)
+        return callback(rs, socket, data, data_size, callback_ctx);
     
+    return (ssize_t)data_size;
 }
 
 bool _rtp_socket_accept_callback(socket_p socket, socket_p new_socket, void* ctx) {
     
     struct rtp_socket_t* rs = (struct rtp_socket_t*)ctx;
+    if (rs == NULL || new_socket == NULL)
+        return false;
     
-    if (new_socket != NULL) {
-        
-        if (rs->allowed_remote_end_point == NULL || sockaddr_equals_host(socket_get_remote_end_point(new_socket), rs->allowed_remote_end_point)) {
-            _rtp_socket_add_socket(rs, new_socket, true);
-            return true;
-        } else {
-            socket_close(new_socket);
-            socket_destroy(new_socket);
-        }
-        
-    }
+    struct sockaddr* remote_end_point = socket_get_remote_end_point(new_socket);
     
-    return false;
+    mutex_lock(rs->mutex);
+    bool allowed = !rs->destroying &&
+        (rs->allowed_remote_end_point == NULL ||
+         (remote_end_point != NULL && sockaddr_equals_host(remote_end_point, rs->allowed_remote_end_point)));
+    mutex_unlock(rs->mutex);
     
+    if (!allowed)
+        return false;
+    
+    struct rtp_socket_info_t* info = _rtp_socket_store_socket(rs, new_socket, true);
+    if (info == NULL)
+        return false;
+    
+    _rtp_socket_configure_socket(rs, info);
+    return true;
 }
-
 
 bool rtp_socket_setup(struct rtp_socket_t* rs, struct sockaddr* local_end_point) {
     
+    if (rs == NULL || local_end_point == NULL)
+        return false;
+    
     socket_p udp_socket = socket_create("RTP UDP Socket", true);
     socket_p tcp_socket = socket_create("RTP TCP Listen Socket", false);
-    
-    if (socket_bind(udp_socket, local_end_point) && socket_bind(tcp_socket, local_end_point)) {
-        _rtp_socket_add_socket(rs, udp_socket, true);
-        socket_set_receive_callback(udp_socket, _rtp_socket_socket_receive_callback, rs);
-        _rtp_socket_add_socket(rs, tcp_socket, false);
-        socket_set_accept_callback(tcp_socket, _rtp_socket_accept_callback, rs);
-        return true;
+    if (udp_socket == NULL || tcp_socket == NULL) {
+        socket_destroy(udp_socket);
+        socket_destroy(tcp_socket);
+        return false;
     }
     
-    socket_destroy(udp_socket);
-    socket_destroy(tcp_socket);
+    if (!socket_bind(udp_socket, local_end_point) || !socket_bind(tcp_socket, local_end_point)) {
+        socket_destroy(udp_socket);
+        socket_destroy(tcp_socket);
+        return false;
+    }
     
-    return false;
+    struct rtp_socket_info_t* udp_info = _rtp_socket_store_socket(rs, udp_socket, true);
+    if (udp_info == NULL) {
+        socket_destroy(udp_socket);
+        socket_destroy(tcp_socket);
+        return false;
+    }
     
+    struct rtp_socket_info_t* tcp_info = _rtp_socket_store_socket(rs, tcp_socket, false);
+    if (tcp_info == NULL) {
+        struct rtp_socket_info_t* detached = _rtp_socket_detach_socket(rs, udp_socket);
+        free(detached);
+        socket_destroy(udp_socket);
+        socket_destroy(tcp_socket);
+        return false;
+    }
+    
+    _rtp_socket_configure_socket(rs, udp_info);
+    _rtp_socket_configure_socket(rs, tcp_info);
+    socket_set_accept_callback(tcp_socket, _rtp_socket_accept_callback, rs);
+    
+    return true;
 }
 
 void rtp_socket_set_data_received_callback(struct rtp_socket_t* rs, rtp_socket_data_received_callback callback, void* ctx) {
     
-    rs->received_callback = callback;
-    rs->received_callback_ctx = ctx;
-    
+    if (rs == NULL)
+        return;
+    mutex_lock(rs->mutex);
+    if (!rs->destroying) {
+        rs->received_callback = callback;
+        rs->received_callback_ctx = ctx;
+    }
+    mutex_unlock(rs->mutex);
 }
 
 void rtp_socket_send_to(struct rtp_socket_t* rs, struct sockaddr* dst, const void* buffer, uint32_t size) {
     
-    for (uint32_t i = 0 ; i < rs->sockets_count ; i++)
-        if (rs->sockets[i]->is_data_socket)
-            socket_send_to(rs->sockets[i]->socket, dst, buffer, size);
+    if (rs == NULL || dst == NULL || buffer == NULL || size == 0)
+        return;
     
+    mutex_lock(rs->mutex);
+    if (!rs->destroying) {
+        for (uint32_t i = 0 ; i < rs->sockets_count ; i++) {
+            if (rs->sockets[i] != NULL && rs->sockets[i]->is_data_socket)
+                socket_send_to(rs->sockets[i]->socket, dst, buffer, size);
+        }
+    }
+    mutex_unlock(rs->mutex);
 }
 
 uint16_t rtp_socket_get_local_port(rtp_socket_p rs) {
     
-    for (uint32_t i = 0 ; i < rs->sockets_count ; i++)
-        if (!rs->sockets[i]->is_data_socket)
-            return sockaddr_get_port(socket_get_local_end_point(rs->sockets[i]->socket));
+    if (rs == NULL)
+        return 0;
     
-    return 0;
+    uint16_t port = 0;
+    mutex_lock(rs->mutex);
+    if (!rs->destroying) {
+        for (uint32_t i = 0 ; i < rs->sockets_count ; i++) {
+            if (rs->sockets[i] != NULL && !rs->sockets[i]->is_data_socket) {
+                struct sockaddr* end_point = socket_get_local_end_point(rs->sockets[i]->socket);
+                if (end_point != NULL)
+                    port = sockaddr_get_port(end_point);
+                break;
+            }
+        }
+    }
+    mutex_unlock(rs->mutex);
     
+    return port;
 }
