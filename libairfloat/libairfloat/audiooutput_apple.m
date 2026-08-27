@@ -163,7 +163,6 @@ static void _audio_output_dispose(struct audio_output_t* ao) {
     ao->callback_ctx = NULL;
     
     if (ao->graph != NULL) {
-        AUGraphStop(ao->graph);
         AUGraphUninitialize(ao->graph);
         OSStatus status = DisposeAUGraph(ao->graph);
         if (status != noErr)
@@ -287,6 +286,7 @@ void audio_output_destroy(struct audio_output_t* ao) {
     if (ao == NULL)
         return;
     
+    audio_output_stop(ao);
     _audio_output_dispose(ao);
     free(ao);
 }
