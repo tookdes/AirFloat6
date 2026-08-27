@@ -246,57 +246,155 @@ struct zeroconf_dacp_discover_t {
     CFNetServiceBrowserRef domain_browser;
     CFNetServiceBrowserRef* service_browsers;
     uint32_t service_browsers_count;
+    CFNetServiceRef* resolving_services;
+    uint32_t resolving_services_count;
     CFRunLoopRef run_loop;
     thread_p thread;
     mutex_p mutex;
     condition_p condition;
     bool run_loop_ready;
+    bool destroying;
     zeroconf_dacp_discover_service_found_callback service_found_callback;
     void* service_found_callback_ctx;
 };
 
+static bool _zeroconf_dacp_discover_track_service(struct zeroconf_dacp_discover_t* zd, CFNetServiceRef service) {
+    if (zd == NULL || service == NULL)
+        return false;
+    
+    mutex_lock(zd->mutex);
+    
+    if (zd->destroying) {
+        mutex_unlock(zd->mutex);
+        return false;
+    }
+    
+    for (uint32_t i = 0 ; i < zd->resolving_services_count ; i++) {
+        if (zd->resolving_services[i] == service) {
+            mutex_unlock(zd->mutex);
+            return false;
+        }
+    }
+    
+    CFNetServiceRef* services = (CFNetServiceRef*)realloc(zd->resolving_services, sizeof(CFNetServiceRef) * (zd->resolving_services_count + 1));
+    if (services == NULL) {
+        mutex_unlock(zd->mutex);
+        return false;
+    }
+    
+    zd->resolving_services = services;
+    CFRetain(service);
+    zd->resolving_services[zd->resolving_services_count++] = service;
+    
+    mutex_unlock(zd->mutex);
+    return true;
+}
+
+static bool _zeroconf_dacp_discover_untrack_service(struct zeroconf_dacp_discover_t* zd, CFNetServiceRef service, CFRunLoopRef* run_loop) {
+    if (run_loop != NULL)
+        *run_loop = NULL;
+    if (zd == NULL || service == NULL)
+        return false;
+    
+    bool found = false;
+    
+    mutex_lock(zd->mutex);
+    for (uint32_t i = 0 ; i < zd->resolving_services_count ; i++) {
+        if (zd->resolving_services[i] == service) {
+            for (uint32_t x = i + 1 ; x < zd->resolving_services_count ; x++)
+                zd->resolving_services[x - 1] = zd->resolving_services[x];
+            zd->resolving_services_count--;
+            found = true;
+            break;
+        }
+    }
+    
+    if (zd->resolving_services_count == 0) {
+        free(zd->resolving_services);
+        zd->resolving_services = NULL;
+    }
+    
+    if (run_loop != NULL)
+        *run_loop = zd->run_loop;
+    mutex_unlock(zd->mutex);
+    
+    return found;
+}
+
+static void _zeroconf_dacp_discover_finish_service(struct zeroconf_dacp_discover_t* zd, CFNetServiceRef service) {
+    CFRunLoopRef run_loop = NULL;
+    if (!_zeroconf_dacp_discover_untrack_service(zd, service, &run_loop))
+        return;
+    
+    CFNetServiceSetClient(service, NULL, NULL);
+    CFNetServiceCancel(service);
+    if (run_loop != NULL)
+        CFNetServiceUnscheduleFromRunLoop(service, run_loop, kCFRunLoopCommonModes);
+    CFRelease(service);
+}
+
 void _zeroconf_dacp_discover_resolve_callback(CFNetServiceRef service, CFStreamError* error, void* info) {
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)info;
-    if (zd == NULL || service == NULL || (error != NULL && error->error != 0))
+    if (zd == NULL || service == NULL)
         return;
     
-    CFArrayRef addresses = CFNetServiceGetAddressing(service);
-    if (addresses == NULL)
-        return;
-    
-    CFIndex cf_addresses_count = CFArrayGetCount(addresses);
-    if (cf_addresses_count <= 0 || cf_addresses_count > UINT32_MAX)
-        return;
-    
-    uint32_t addresses_count = (uint32_t)cf_addresses_count;
-    struct sockaddr** end_points = (struct sockaddr**)calloc(addresses_count, sizeof(struct sockaddr*));
-    if (end_points == NULL)
-        return;
-    
-    uint32_t valid_count = 0;
-    for (uint32_t i = 0 ; i < addresses_count ; i++) {
-        CFDataRef sockaddr_data = (CFDataRef)CFArrayGetValueAtIndex(addresses, i);
-        if (sockaddr_data == NULL || CFDataGetLength(sockaddr_data) < (CFIndex)sizeof(struct sockaddr))
-            continue;
-        struct sockaddr* end_point = (struct sockaddr*)CFDataGetBytePtr(sockaddr_data);
-        struct sockaddr* copy = sockaddr_copy(end_point);
-        if (copy != NULL)
-            end_points[valid_count++] = copy;
-    }
+    bool resolve_ok = (error == NULL || error->error == 0);
     
     char service_name[256];
     bool has_name = _zeroconf_cfstring_to_cstring(CFNetServiceGetName(service), service_name, sizeof(service_name));
     
-    zeroconf_dacp_discover_service_found_callback callback = zd->service_found_callback;
-    void* callback_ctx = zd->service_found_callback_ctx;
-    if (valid_count > 0 && has_name && callback != NULL)
+    struct sockaddr** end_points = NULL;
+    uint32_t valid_count = 0;
+    
+    if (resolve_ok) {
+        CFArrayRef addresses = CFNetServiceGetAddressing(service);
+        if (addresses != NULL) {
+            CFIndex cf_addresses_count = CFArrayGetCount(addresses);
+            if (cf_addresses_count > 0 && cf_addresses_count <= UINT32_MAX) {
+                uint32_t addresses_count = (uint32_t)cf_addresses_count;
+                end_points = (struct sockaddr**)calloc(addresses_count, sizeof(struct sockaddr*));
+                if (end_points != NULL) {
+                    for (uint32_t i = 0 ; i < addresses_count ; i++) {
+                        CFDataRef sockaddr_data = (CFDataRef)CFArrayGetValueAtIndex(addresses, i);
+                        if (sockaddr_data == NULL)
+                            continue;
+                        CFIndex sockaddr_length = CFDataGetLength(sockaddr_data);
+                        if (sockaddr_length < (CFIndex)sizeof(struct sockaddr))
+                            continue;
+                        const struct sockaddr* end_point = (const struct sockaddr*)CFDataGetBytePtr(sockaddr_data);
+                        if (end_point == NULL || end_point->sa_len == 0 || (CFIndex)end_point->sa_len > sockaddr_length)
+                            continue;
+                        struct sockaddr* copy = sockaddr_copy((struct sockaddr*)end_point);
+                        if (copy != NULL)
+                            end_points[valid_count++] = copy;
+                    }
+                }
+            }
+        }
+    }
+    
+    /* Remove the service from the run loop before user code is called. This
+       guarantees that a callback destroying zd cannot leave another resolver
+       callback queued with a stale info pointer. */
+    _zeroconf_dacp_discover_finish_service(zd, service);
+    
+    zeroconf_dacp_discover_service_found_callback callback = NULL;
+    void* callback_ctx = NULL;
+    bool destroying = false;
+    mutex_lock(zd->mutex);
+    destroying = zd->destroying;
+    callback = zd->service_found_callback;
+    callback_ctx = zd->service_found_callback_ctx;
+    mutex_unlock(zd->mutex);
+    
+    if (!destroying && resolve_ok && valid_count > 0 && has_name && callback != NULL)
         callback(zd, service_name, end_points, valid_count, callback_ctx);
     
     for (uint32_t i = 0 ; i < valid_count ; i++)
         sockaddr_destroy(end_points[i]);
     free(end_points);
     
-    if (has_name)
+    if (resolve_ok && has_name)
         log_message(LOG_INFO, "Found DACP Service: %s", service_name);
 }
 
@@ -305,7 +403,10 @@ void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFO
     if (zd == NULL || browser == NULL || domainOrService == NULL || (error != NULL && error->error != 0))
         return;
     
-    if ((flags & kCFNetServiceFlagRemove) != 0)
+    mutex_lock(zd->mutex);
+    bool destroying = zd->destroying;
+    mutex_unlock(zd->mutex);
+    if (destroying || (flags & kCFNetServiceFlagRemove) != 0)
         return;
     
     if (browser == zd->domain_browser) {
@@ -318,6 +419,11 @@ void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFO
             return;
         
         mutex_lock(zd->mutex);
+        if (zd->destroying) {
+            mutex_unlock(zd->mutex);
+            CFRelease(service_browser);
+            return;
+        }
         CFNetServiceBrowserRef* browsers = (CFNetServiceBrowserRef*)realloc(zd->service_browsers, sizeof(CFNetServiceBrowserRef) * (zd->service_browsers_count + 1));
         if (browsers == NULL) {
             mutex_unlock(zd->mutex);
@@ -343,19 +449,68 @@ void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFO
         CFArrayRef addresses = CFNetServiceGetAddressing(service);
         
         if (addresses == NULL) {
+            if (!_zeroconf_dacp_discover_track_service(zd, service))
+                return;
+            
             CFNetServiceClientContext context = { 0, zd, NULL, NULL, NULL };
-            CFNetServiceSetClient(service, _zeroconf_dacp_discover_resolve_callback, &context);
+            if (!CFNetServiceSetClient(service, _zeroconf_dacp_discover_resolve_callback, &context)) {
+                _zeroconf_dacp_discover_finish_service(zd, service);
+                return;
+            }
             
             mutex_lock(zd->mutex);
             CFRunLoopRef run_loop = zd->run_loop;
             mutex_unlock(zd->mutex);
             
-            if (run_loop != NULL) {
-                CFNetServiceScheduleWithRunLoop(service, run_loop, kCFRunLoopCommonModes);
-                CFNetServiceResolveWithTimeout(service, 30.0, NULL);
+            if (run_loop == NULL) {
+                _zeroconf_dacp_discover_finish_service(zd, service);
+                return;
             }
-        } else
-            _zeroconf_dacp_discover_resolve_callback(service, NULL, zd);
+            
+            CFNetServiceScheduleWithRunLoop(service, run_loop, kCFRunLoopCommonModes);
+            if (!CFNetServiceResolveWithTimeout(service, 30.0, NULL))
+                _zeroconf_dacp_discover_finish_service(zd, service);
+        } else {
+            /* Already-resolved services are owned by the browser callback and
+               do not need to enter the tracked asynchronous resolver list. */
+            char service_name[256];
+            bool has_name = _zeroconf_cfstring_to_cstring(CFNetServiceGetName(service), service_name, sizeof(service_name));
+            CFIndex cf_addresses_count = CFArrayGetCount(addresses);
+            if (cf_addresses_count > 0 && cf_addresses_count <= UINT32_MAX) {
+                uint32_t addresses_count = (uint32_t)cf_addresses_count;
+                struct sockaddr** end_points = (struct sockaddr**)calloc(addresses_count, sizeof(struct sockaddr*));
+                if (end_points != NULL) {
+                    uint32_t valid_count = 0;
+                    for (uint32_t i = 0 ; i < addresses_count ; i++) {
+                        CFDataRef sockaddr_data = (CFDataRef)CFArrayGetValueAtIndex(addresses, i);
+                        if (sockaddr_data == NULL)
+                            continue;
+                        CFIndex sockaddr_length = CFDataGetLength(sockaddr_data);
+                        if (sockaddr_length < (CFIndex)sizeof(struct sockaddr))
+                            continue;
+                        const struct sockaddr* end_point = (const struct sockaddr*)CFDataGetBytePtr(sockaddr_data);
+                        if (end_point == NULL || end_point->sa_len == 0 || (CFIndex)end_point->sa_len > sockaddr_length)
+                            continue;
+                        struct sockaddr* copy = sockaddr_copy((struct sockaddr*)end_point);
+                        if (copy != NULL)
+                            end_points[valid_count++] = copy;
+                    }
+                    
+                    mutex_lock(zd->mutex);
+                    destroying = zd->destroying;
+                    zeroconf_dacp_discover_service_found_callback callback = zd->service_found_callback;
+                    void* callback_ctx = zd->service_found_callback_ctx;
+                    mutex_unlock(zd->mutex);
+                    
+                    if (!destroying && has_name && valid_count > 0 && callback != NULL)
+                        callback(zd, service_name, end_points, valid_count, callback_ctx);
+                    
+                    for (uint32_t i = 0 ; i < valid_count ; i++)
+                        sockaddr_destroy(end_points[i]);
+                    free(end_points);
+                }
+            }
+        }
     }
 }
 
@@ -404,18 +559,36 @@ void _zeroconf_dacp_discover_run_loop_thread(void* ctx) {
     CFNetServiceBrowserInvalidate(zd->domain_browser);
     
     mutex_lock(zd->mutex);
-    for (uint32_t i = 0 ; i < zd->service_browsers_count ; i++) {
-        if (zd->service_browsers[i] != NULL) {
-            CFNetServiceBrowserUnscheduleFromRunLoop(zd->service_browsers[i], run_loop, kCFRunLoopCommonModes);
-            CFNetServiceBrowserInvalidate(zd->service_browsers[i]);
-            CFRelease(zd->service_browsers[i]);
-        }
-    }
-    free(zd->service_browsers);
+    CFNetServiceBrowserRef* service_browsers = zd->service_browsers;
+    uint32_t service_browsers_count = zd->service_browsers_count;
     zd->service_browsers = NULL;
     zd->service_browsers_count = 0;
+    
+    CFNetServiceRef* resolving_services = zd->resolving_services;
+    uint32_t resolving_services_count = zd->resolving_services_count;
+    zd->resolving_services = NULL;
+    zd->resolving_services_count = 0;
     zd->run_loop = NULL;
     mutex_unlock(zd->mutex);
+    
+    for (uint32_t i = 0 ; i < service_browsers_count ; i++) {
+        if (service_browsers[i] != NULL) {
+            CFNetServiceBrowserUnscheduleFromRunLoop(service_browsers[i], run_loop, kCFRunLoopCommonModes);
+            CFNetServiceBrowserInvalidate(service_browsers[i]);
+            CFRelease(service_browsers[i]);
+        }
+    }
+    free(service_browsers);
+    
+    for (uint32_t i = 0 ; i < resolving_services_count ; i++) {
+        if (resolving_services[i] != NULL) {
+            CFNetServiceSetClient(resolving_services[i], NULL, NULL);
+            CFNetServiceCancel(resolving_services[i]);
+            CFNetServiceUnscheduleFromRunLoop(resolving_services[i], run_loop, kCFRunLoopCommonModes);
+            CFRelease(resolving_services[i]);
+        }
+    }
+    free(resolving_services);
 }
 
 struct zeroconf_dacp_discover_t* zeroconf_dacp_discover_create() {
@@ -440,20 +613,9 @@ struct zeroconf_dacp_discover_t* zeroconf_dacp_discover_create() {
         return NULL;
     }
     
-    mutex_lock(zd->mutex);
-    zd->thread = thread_create_a(_zeroconf_dacp_discover_run_loop_thread, zd);
-    if (zd->thread == NULL) {
-        mutex_unlock(zd->mutex);
-        condition_destroy(zd->condition);
-        mutex_destroy(zd->mutex);
-        CFRelease(zd->domain_browser);
-        free(zd);
-        return NULL;
-    }
-    while (!zd->run_loop_ready)
-        condition_wait(zd->condition, zd->mutex);
-    mutex_unlock(zd->mutex);
-    
+    /* Browsing is started by set_callback(). This guarantees that a service
+       already present on the LAN cannot be discovered before the owner has
+       installed its callback. */
     return zd;
 }
 
@@ -462,14 +624,22 @@ void zeroconf_dacp_discover_destroy(struct zeroconf_dacp_discover_t* zd) {
         return;
     
     mutex_lock(zd->mutex);
+    if (zd->destroying) {
+        mutex_unlock(zd->mutex);
+        return;
+    }
+    zd->destroying = true;
+    zd->service_found_callback = NULL;
+    zd->service_found_callback_ctx = NULL;
     CFRunLoopRef run_loop = zd->run_loop;
+    thread_p thread = zd->thread;
     mutex_unlock(zd->mutex);
     
     if (run_loop != NULL)
         CFRunLoopStop(run_loop);
     
-    thread_destroy(zd->thread);
-    zd->thread = NULL;
+    if (thread != NULL)
+        thread_destroy(thread);
     
     condition_destroy(zd->condition);
     mutex_destroy(zd->mutex);
@@ -485,8 +655,23 @@ void zeroconf_dacp_discover_set_callback(struct zeroconf_dacp_discover_t* zd, ze
         return;
     
     mutex_lock(zd->mutex);
+    if (zd->destroying) {
+        mutex_unlock(zd->mutex);
+        return;
+    }
+    
     zd->service_found_callback = callback;
     zd->service_found_callback_ctx = ctx;
+    
+    if (callback != NULL && zd->thread == NULL) {
+        zd->run_loop_ready = false;
+        zd->thread = thread_create_a(_zeroconf_dacp_discover_run_loop_thread, zd);
+        if (zd->thread != NULL) {
+            while (!zd->run_loop_ready)
+                condition_wait(zd->condition, zd->mutex);
+        }
+    }
+    
     mutex_unlock(zd->mutex);
 }
 
