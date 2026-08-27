@@ -40,6 +40,7 @@
 struct web_client_connection_t {
     socket_p socket;
     mutex_p mutex;
+    bool destroying;
     web_request_p* requests;
     uint32_t requests_count;
     struct {
@@ -58,17 +59,25 @@ struct web_client_connection_t {
 
 void _web_client_connection_send_next_request(struct web_client_connection_t* wc) {
     
+    if (wc == NULL)
+        return;
+    
     mutex_lock(wc->mutex);
     
-    if (web_client_connection_is_connected(wc) && wc->requests_count > 0) {
+    if (!wc->destroying && wc->socket != NULL && socket_is_connected(wc->socket) && wc->requests_count > 0) {
         
         size_t request_len = web_request_write(wc->requests[0], NULL, 0);
-        char* data[request_len];
-        web_request_write(wc->requests[0], data, request_len);
-        
-        log_data(LOG_INFO, data, request_len);
-        
-        socket_send(wc->socket, data, request_len);
+        if (request_len > 0) {
+            char* data = (char*)malloc(request_len);
+            if (data != NULL) {
+                size_t written = web_request_write(wc->requests[0], data, request_len);
+                if (written == request_len) {
+                    log_data(LOG_INFO, data, request_len);
+                    socket_send(wc->socket, data, request_len);
+                }
+                free(data);
+            }
+        }
 
     }
     
@@ -80,7 +89,7 @@ void _web_client_connection_socket_connected_callback(socket_p socket, void* ctx
     
     struct web_client_connection_t* wc = (struct web_client_connection_t*)ctx;
     
-    if (wc->callbacks.connected != NULL)
+    if (wc != NULL && wc->callbacks.connected != NULL)
         wc->callbacks.connected(wc, wc->callbacks.ctx.connected);
     
 }
@@ -89,7 +98,7 @@ void _web_client_connection_socket_connect_failed_callback(socket_p socket, void
     
     struct web_client_connection_t* wc = (struct web_client_connection_t*)ctx;
     
-    if (wc->callbacks.connect_failed)
+    if (wc != NULL && wc->callbacks.connect_failed != NULL)
         wc->callbacks.connect_failed(wc, wc->callbacks.ctx.connect_failed);
     
 }
@@ -97,30 +106,55 @@ void _web_client_connection_socket_connect_failed_callback(socket_p socket, void
 ssize_t _web_client_connection_socket_receive_callback(socket_p socket, const void* data, size_t data_size, struct sockaddr* remote_end_point, void* ctx) {
     
     struct web_client_connection_t* wc = (struct web_client_connection_t*)ctx;
+    if (wc == NULL)
+        return -1;
     
     web_response_p response = web_response_create();
+    if (response == NULL)
+        return -1;
     
-    ssize_t ret = 0;
-    if ((ret = web_response_parse(response, data, data_size)) > 0) {
+    ssize_t ret = web_response_parse(response, data, data_size);
+    if (ret > 0) {
+        
+        web_request_p completed_request = NULL;
+        web_client_connection_response_received_callback response_callback = NULL;
+        void* response_callback_ctx = NULL;
         
         mutex_lock(wc->mutex);
         
-        if (wc->callbacks.response_received != NULL) {
-            mutex_unlock(wc->mutex);
-            wc->callbacks.response_received(wc, wc->requests[0], response, wc->callbacks.ctx.response_received);
-            mutex_lock(wc->mutex);
+        if (!wc->destroying && wc->requests_count > 0) {
+            completed_request = wc->requests[0];
+            for (uint32_t i = 1 ; i < wc->requests_count ; i++)
+                wc->requests[i - 1] = wc->requests[i];
+            wc->requests_count--;
+            
+            if (wc->requests_count == 0) {
+                free(wc->requests);
+                wc->requests = NULL;
+            }
+            
+            response_callback = wc->callbacks.response_received;
+            response_callback_ctx = wc->callbacks.ctx.response_received;
         }
-        
-        web_request_destroy(wc->requests[0]);
-        
-        for (uint32_t i = 0 ; i < wc->requests_count - 1 ; i++)
-            wc->requests[i] = wc->requests[i + 1];
-        
-        wc->requests_count--;
         
         mutex_unlock(wc->mutex);
         
+        if (completed_request == NULL) {
+            web_response_destroy(response);
+            return -1;
+        }
+        
+        /* Send the next queued request while the connection is still known
+           to be alive. The response callback is allowed to destroy wc, so no
+           access to wc is permitted after invoking it. */
         _web_client_connection_send_next_request(wc);
+        
+        if (response_callback != NULL)
+            response_callback(wc, completed_request, response, response_callback_ctx);
+        
+        web_request_destroy(completed_request);
+        web_response_destroy(response);
+        return ret;
         
     }
     
@@ -134,7 +168,7 @@ void _web_connection_socket_closed_callback(socket_p socket, void* ctx) {
     
     struct web_client_connection_t* wc = (struct web_client_connection_t*)ctx;
     
-    if (wc->callbacks.disconnected != NULL)
+    if (wc != NULL && wc->callbacks.disconnected != NULL)
         wc->callbacks.disconnected(wc, wc->callbacks.ctx.disconnected);
     
 }
@@ -142,9 +176,16 @@ void _web_connection_socket_closed_callback(socket_p socket, void* ctx) {
 struct web_client_connection_t* web_client_connection_create() {
     
     struct web_client_connection_t* wc = (struct web_client_connection_t*)malloc(sizeof(struct web_client_connection_t));
+    if (wc == NULL)
+        return NULL;
+    
     bzero(wc, sizeof(struct web_client_connection_t));
     
     wc->mutex = mutex_create();
+    if (wc->mutex == NULL) {
+        free(wc);
+        return NULL;
+    }
     
     return wc;
     
@@ -152,19 +193,47 @@ struct web_client_connection_t* web_client_connection_create() {
 
 void web_client_connection_destroy(struct web_client_connection_t* wc) {
     
-    if (wc->socket != NULL) {
-        socket_destroy(wc->socket);
-        wc->socket = NULL;
+    if (wc == NULL)
+        return;
+    
+    mutex_lock(wc->mutex);
+    
+    if (wc->destroying) {
+        mutex_unlock(wc->mutex);
+        return;
     }
     
-    mutex_destroy(wc->mutex);
+    wc->destroying = true;
+    socket_p socket = wc->socket;
+    wc->socket = NULL;
     
+    web_request_p* requests = wc->requests;
+    uint32_t requests_count = wc->requests_count;
+    wc->requests = NULL;
+    wc->requests_count = 0;
+    
+    mutex_unlock(wc->mutex);
+    
+    if (socket != NULL) {
+        /* An explicit destroy owns the disconnect; do not recurse through
+           the client disconnected callback while tearing the object down. */
+        socket_set_closed_callback(socket, NULL, NULL);
+        socket_destroy(socket);
+    }
+    
+    for (uint32_t i = 0 ; i < requests_count ; i++)
+        web_request_destroy(requests[i]);
+    free(requests);
+    
+    mutex_destroy(wc->mutex);
     free(wc);
     
 }
 
 void web_client_connection_set_connected_callback(struct web_client_connection_t* wc, web_client_connection_connected_callback callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     wc->callbacks.connected = callback;
     wc->callbacks.ctx.connected = ctx;
     
@@ -172,6 +241,8 @@ void web_client_connection_set_connected_callback(struct web_client_connection_t
 
 void web_client_connection_set_connect_failed_callback(struct web_client_connection_t* wc, web_client_connection_connect_failed_callback callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     wc->callbacks.connect_failed = callback;
     wc->callbacks.ctx.connect_failed = ctx;
     
@@ -179,6 +250,8 @@ void web_client_connection_set_connect_failed_callback(struct web_client_connect
 
 void web_client_connection_set_response_received_callback(struct web_client_connection_t* wc, web_client_connection_response_received_callback callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     wc->callbacks.response_received = callback;
     wc->callbacks.ctx.response_received = ctx;
     
@@ -186,6 +259,8 @@ void web_client_connection_set_response_received_callback(struct web_client_conn
 
 void web_client_connection_set_disconneced_callback(struct web_client_connection_t* wc, web_client_connection_disconnected_callback callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     wc->callbacks.disconnected = callback;
     wc->callbacks.ctx.disconnected = ctx;
     
@@ -193,16 +268,36 @@ void web_client_connection_set_disconneced_callback(struct web_client_connection
 
 void web_client_connection_connect(struct web_client_connection_t* wc, struct sockaddr* end_point) {
     
-    if (wc->socket == NULL) {
+    if (wc == NULL || end_point == NULL)
+        return;
+    
+    mutex_lock(wc->mutex);
+    bool should_connect = (!wc->destroying && wc->socket == NULL);
+    mutex_unlock(wc->mutex);
+    
+    if (should_connect) {
         
-        wc->socket = socket_create("Web connection", false);
+        socket_p socket = socket_create("Web connection", false);
+        if (socket == NULL)
+            return;
         
-        socket_set_connected_callback(wc->socket, _web_client_connection_socket_connected_callback, wc);
-        socket_set_connect_failed_callback(wc->socket, _web_client_connection_socket_connect_failed_callback, wc);
-        socket_set_receive_callback(wc->socket, _web_client_connection_socket_receive_callback, wc);
-        socket_set_closed_callback(wc->socket, _web_connection_socket_closed_callback, wc);
+        socket_set_connected_callback(socket, _web_client_connection_socket_connected_callback, wc);
+        socket_set_connect_failed_callback(socket, _web_client_connection_socket_connect_failed_callback, wc);
+        socket_set_receive_callback(socket, _web_client_connection_socket_receive_callback, wc);
+        socket_set_closed_callback(socket, _web_connection_socket_closed_callback, wc);
         
-        socket_connect(wc->socket, end_point);
+        mutex_lock(wc->mutex);
+        if (!wc->destroying && wc->socket == NULL) {
+            wc->socket = socket;
+            socket = NULL;
+        }
+        socket_p active_socket = wc->socket;
+        mutex_unlock(wc->mutex);
+        
+        if (socket != NULL)
+            socket_destroy(socket);
+        else if (active_socket != NULL)
+            socket_connect(active_socket, end_point);
         
     }
     
@@ -210,27 +305,47 @@ void web_client_connection_connect(struct web_client_connection_t* wc, struct so
 
 bool web_client_connection_is_connected(struct web_client_connection_t* wc) {
     
-    return (wc->socket != NULL && socket_is_connected(wc->socket));
+    if (wc == NULL)
+        return false;
+    
+    mutex_lock(wc->mutex);
+    bool ret = (!wc->destroying && wc->socket != NULL && socket_is_connected(wc->socket));
+    mutex_unlock(wc->mutex);
+    
+    return ret;
     
 }
 
 void web_client_connection_send_request(web_client_connection_p wc, web_request_p request) {
     
-    if (web_client_connection_is_connected(wc)) {
-        
-        mutex_lock(wc->mutex);
-        
-        wc->requests = (web_request_p*)realloc(wc->requests, sizeof(web_request_p) * (wc->requests_count + 1));
-        wc->requests[wc->requests_count] = web_request_copy(request);
-        wc->requests_count++;
-        
-        bool send = (wc->requests_count == 1);
-        
-        mutex_unlock(wc->mutex);
-        
-        if (send)
-            _web_client_connection_send_next_request(wc);
-        
+    if (wc == NULL || request == NULL)
+        return;
+    
+    web_request_p request_copy = web_request_copy(request);
+    if (request_copy == NULL)
+        return;
+    
+    bool send = false;
+    
+    mutex_lock(wc->mutex);
+    
+    if (!wc->destroying && wc->socket != NULL && socket_is_connected(wc->socket)) {
+        web_request_p* requests = (web_request_p*)realloc(wc->requests, sizeof(web_request_p) * (wc->requests_count + 1));
+        if (requests != NULL) {
+            wc->requests = requests;
+            wc->requests[wc->requests_count] = request_copy;
+            wc->requests_count++;
+            request_copy = NULL;
+            send = (wc->requests_count == 1);
+        }
     }
+    
+    mutex_unlock(wc->mutex);
+    
+    if (request_copy != NULL)
+        web_request_destroy(request_copy);
+    
+    if (send)
+        _web_client_connection_send_next_request(wc);
     
 }
