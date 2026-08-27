@@ -83,6 +83,10 @@ void _socket_enable_tcp_keepalive(int socket_fd) {
     int enabled = 1;
     setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
     
+#if defined(SO_NOSIGPIPE)
+    setsockopt(socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
+    
     /* Keep paused RAOP sessions alive while allowing dead Wi-Fi peers to be
        detected promptly. Darwin exposes the idle time as TCP_KEEPALIVE. */
 #if defined(TCP_KEEPALIVE)
@@ -412,13 +416,13 @@ void socket_connect(struct socket_t* s, struct sockaddr* end_point) {
     
     if (!s->is_connected && !s->is_udp) {
         
-        if (s->socket <= 0) {
+        if (s->socket < 0) {
             s->socket = socket(end_point->sa_family, SOCK_STREAM, IPPROTO_TCP);
-            if (s->socket > 0)
+            if (s->socket >= 0)
                 _socket_enable_tcp_keepalive(s->socket);
         }
         
-        if (s->socket <= 0)
+        if (s->socket < 0)
             log_message(LOG_ERROR, "Socket creation error: %s", strerror(errno));
         
         if (s->remote_end_point != NULL)
