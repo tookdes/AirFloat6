@@ -1,5 +1,5 @@
 //
-//  struct condition_t*osix.c
+//  condition_posix.c
 //  AirFloat
 //
 //  Copyright (c) 2013, Kristian Trenskow All rights reserved.
@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <stdint.h>
 
 #include "condition.h"
 
@@ -46,57 +47,65 @@ struct condition_t {
 struct condition_t* condition_create() {
     
     struct condition_t* c = (struct condition_t*)malloc(sizeof(struct condition_t));
+    if (c == NULL)
+        return NULL;
     
-    pthread_cond_init(&c->cond, NULL);
+    if (pthread_cond_init(&c->cond, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
     
     return c;
-    
 }
 
 void condition_destroy(struct condition_t* c) {
     
+    if (c == NULL)
+        return;
     pthread_cond_destroy(&c->cond);
     free(c);
-    
 }
 
 void condition_wait(struct condition_t* c, mutex_p mutex) {
     
-    pthread_cond_wait(&c->cond, mutex_pthread(mutex));
-    
+    pthread_mutex_t* pthread_mutex = mutex_pthread(mutex);
+    if (c != NULL && pthread_mutex != NULL)
+        pthread_cond_wait(&c->cond, pthread_mutex);
 }
 
 bool condition_times_wait(struct condition_t* c, mutex_p mutex, int milliseconds) {
     
-    struct timeval tv;
-    
-    gettimeofday(&tv, NULL);
-    
-    int64_t now = tv.tv_sec * 1000000 + tv.tv_usec;
-    
-    int micro = milliseconds * 1000;
-    
-    int64_t except_time = now + micro;
-    
-    struct timespec req = {except_time / 1000000 , (except_time % 1000000) * 1000};
-    
-    if (pthread_cond_timedwait(&c->cond, mutex_pthread(mutex), &req) == ETIMEDOUT)
+    pthread_mutex_t* pthread_mutex = mutex_pthread(mutex);
+    if (c == NULL || pthread_mutex == NULL || milliseconds < 0)
         return true;
     
-    return false;
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0)
+        return true;
     
+    int64_t now = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+    int64_t micro = (int64_t)milliseconds * 1000;
+    int64_t expected_time = now + micro;
+    
+    struct timespec req = {
+        (time_t)(expected_time / 1000000),
+        (long)((expected_time % 1000000) * 1000)
+    };
+    
+    int result = pthread_cond_timedwait(&c->cond, pthread_mutex, &req);
+    return (result == ETIMEDOUT || result != 0);
 }
 
 void condition_signal(struct condition_t* c) {
     
-    pthread_cond_signal(&c->cond);
-    
+    if (c != NULL)
+        pthread_cond_signal(&c->cond);
 }
 
 void condition_broadcast(struct condition_t* c) {
     
-    pthread_cond_broadcast(&c->cond);
-    
+    if (c != NULL)
+        pthread_cond_broadcast(&c->cond);
 }
 
 #endif
