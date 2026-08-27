@@ -32,6 +32,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <limits.h>
 
@@ -89,7 +90,7 @@ void* decoder_alac_create(const char* rtp_fmtp) {
         return NULL;
     }
     
-    struct AudioStreamBasicDescription in_desc;
+    AudioStreamBasicDescription in_desc;
     bzero(&in_desc, sizeof(in_desc));
     
     in_desc.mFormatID = kAudioFormatAppleLossless;
