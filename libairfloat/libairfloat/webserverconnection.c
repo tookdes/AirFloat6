@@ -32,6 +32,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "log.h"
 #include "mutex.h"
@@ -62,50 +63,58 @@ struct web_server_connection_t {
 ssize_t _web_server_connection_socket_recieve_callback(socket_p socket, const void* data, size_t data_size, struct sockaddr* remote_end_point, void* ctx) {
     
     struct web_server_connection_t* wc = (struct web_server_connection_t*)ctx;
-    
-    mutex_lock(wc->mutex);
-    
-    ssize_t ret = 0;
+    if (wc == NULL)
+        return -1;
     
     web_request_p request = web_request_create();
+    if (request == NULL)
+        return -1;
     
-    if ((ret = web_request_parse(request, data, data_size)) > 0) {
+    ssize_t ret = web_request_parse(request, data, data_size);
+    if (ret > 0) {
+        web_server_connection_request_callback request_callback = NULL;
+        void* request_callback_ctx = NULL;
         
+        mutex_lock(wc->mutex);
+        if (!wc->destroying) {
+            request_callback = wc->request_callback;
+            request_callback_ctx = wc->request_callback_ctx;
+        }
         mutex_unlock(wc->mutex);
         
-        if (wc->request_callback != NULL)
-            wc->request_callback(wc, request, wc->request_callback_ctx);
-        
-    } else
-        mutex_unlock(wc->mutex);
+        if (request_callback != NULL)
+            request_callback(wc, request, request_callback_ctx);
+    }
     
     web_request_destroy(request);
-    
     return ret;
-        
 }
 
 struct web_server_connection_t* web_server_connection_create(socket_p socket, web_server_p server) {
     
+    if (socket == NULL || server == NULL)
+        return NULL;
+    
     struct web_server_connection_t* wc = (struct web_server_connection_t*)malloc(sizeof(struct web_server_connection_t));
+    if (wc == NULL)
+        return NULL;
     bzero(wc, sizeof(struct web_server_connection_t));
     
     wc->socket = socket;
     wc->server = server;
-    
-    wc->is_connected = false;
-    
-    wc->request_callback = NULL;
-    wc->closed_callback = NULL;
-    wc->closed_callback_ctx = wc->request_callback_ctx = NULL;
-    
     wc->mutex = mutex_create();
+    if (wc->mutex == NULL) {
+        free(wc);
+        return NULL;
+    }
     
     return wc;
-    
 }
 
 void web_server_connection_destroy(struct web_server_connection_t* wc) {
+    
+    if (wc == NULL)
+        return;
     
     web_server_connection_closed_callback closed_callback = NULL;
     void* closed_callback_ctx = NULL;
@@ -125,10 +134,6 @@ void web_server_connection_destroy(struct web_server_connection_t* wc) {
     
     wc->destroying = true;
     
-    /* A destroy that did not originate from web_server_connection_close()
-       represents the underlying socket disappearing. Notify the owner once,
-       but mark the connection disconnected first so the callback can safely
-       call web_server_connection_close() without recursing. */
     if (wc->is_connected) {
         wc->is_connected = false;
         closed_callback = wc->closed_callback;
@@ -140,141 +145,140 @@ void web_server_connection_destroy(struct web_server_connection_t* wc) {
     if (closed_callback != NULL)
         closed_callback(wc, closed_callback_ctx);
     
-    socket_close(wc->socket);
+    if (wc->socket != NULL)
+        socket_close(wc->socket);
     
     mutex_destroy(wc->mutex);
-    
     free(wc);
-    
 }
 
 void web_server_connection_set_request_callback(struct web_server_connection_t* wc, web_server_connection_request_callback request_callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     mutex_lock(wc->mutex);
     wc->request_callback = request_callback;
     wc->request_callback_ctx = ctx;
     mutex_unlock(wc->mutex);
-    
 }
 
 void web_server_connection_set_closed_callback(struct web_server_connection_t* wc, web_server_connection_closed_callback closed_callback, void* ctx) {
     
+    if (wc == NULL)
+        return;
     mutex_lock(wc->mutex);
     wc->closed_callback = closed_callback;
     wc->closed_callback_ctx = ctx;
     mutex_unlock(wc->mutex);
-    
 }
 
 void web_server_connection_send_response(web_server_connection_p wc, web_response_p response, const char* protocol, bool close_after_send) {
     
-    size_t content_length = web_response_get_content(response, NULL, 0);
+    if (wc == NULL || response == NULL || protocol == NULL)
+        return;
     
+    size_t content_length = web_response_get_content(response, NULL, 0);
     if (content_length > 0)
-        web_headers_set_value(web_response_get_headers(response), "Content-Length", "%d", content_length);
+        web_headers_set_value(web_response_get_headers(response), "Content-Length", "%lu", (unsigned long)content_length);
     
     size_t response_length = web_response_write(response, protocol, NULL, 0);
+    if (response_length == 0 || content_length > SIZE_MAX - response_length)
+        return;
     
-    char buffer[content_length + response_length];
+    size_t total_length = response_length + content_length;
+    char* buffer = (char*)malloc(total_length > 0 ? total_length : 1);
+    if (buffer == NULL)
+        return;
     
-    web_response_write(response, protocol, buffer, response_length);
-    web_response_get_content(response, buffer + response_length, content_length);
+    if (web_response_write(response, protocol, buffer, response_length) != response_length) {
+        free(buffer);
+        return;
+    }
     
-    socket_send(wc->socket, buffer, content_length + response_length);
+    if (content_length > 0)
+        web_response_get_content(response, buffer + response_length, content_length);
     
-    log_data(LOG_INFO, buffer, content_length + response_length);
+    socket_send(wc->socket, buffer, total_length);
+    log_data(LOG_INFO, buffer, total_length);
+    free(buffer);
     
     if (close_after_send)
         socket_close(wc->socket);
-    
 }
 
 bool web_server_connection_is_connected(struct web_server_connection_t* wc) {
     
+    if (wc == NULL)
+        return false;
     mutex_lock(wc->mutex);
-    bool ret = wc->is_connected;
+    bool ret = wc->is_connected && !wc->destroying;
     mutex_unlock(wc->mutex);
-    
     return ret;
-    
 }
 
 void web_server_connection_take_off(struct web_server_connection_t* wc) {
     
+    if (wc == NULL || wc->socket == NULL)
+        return;
+    
     mutex_lock(wc->mutex);
-    
-    wc->has_taken_off = wc->is_connected = true;
-    
-    socket_set_receive_callback(wc->socket, _web_server_connection_socket_recieve_callback, wc);
-    
+    if (!wc->destroying) {
+        wc->has_taken_off = true;
+        wc->is_connected = true;
+        socket_set_receive_callback(wc->socket, _web_server_connection_socket_recieve_callback, wc);
+    }
     mutex_unlock(wc->mutex);
     
-    const char *ip = sockaddr_get_host(socket_get_remote_end_point(wc->socket));
-    
-    log_message(LOG_INFO, "RAOPConnection (%p) took over connection from %s:%d", wc, ip, sockaddr_get_port(socket_get_remote_end_point(wc->socket)));
-    
+    struct sockaddr* remote_end_point = socket_get_remote_end_point(wc->socket);
+    const char* ip = remote_end_point != NULL ? sockaddr_get_host(remote_end_point) : NULL;
+    log_message(LOG_INFO, "RAOPConnection (%p) took over connection from %s:%d", wc, (ip != NULL ? ip : "unknown"), (remote_end_point != NULL ? sockaddr_get_port(remote_end_point) : 0));
 }
 
 void web_server_connection_close(struct web_server_connection_t* wc) {
     
+    if (wc == NULL)
+        return;
+    
     bool should_close = false;
     
     mutex_lock(wc->mutex);
-    
-    if (wc->is_connected) {
-        
+    if (wc->is_connected && !wc->destroying) {
         log_message(LOG_INFO, "Client disconnected");
-        
         wc->is_connected = false;
         wc->close_in_progress = true;
         should_close = true;
-        
     }
-    
     mutex_unlock(wc->mutex);
     
     if (!should_close)
         return;
     
-    /* socket_close synchronously invokes the server's socket-closed callback.
-       An explicit close is already owned by the caller, so do not invoke the
-       connection closed callback here. The socket-closed path will defer
-       destruction until this function returns. */
     socket_close(wc->socket);
     
     mutex_lock(wc->mutex);
-    
     wc->close_in_progress = false;
     bool should_destroy = wc->destroy_pending && !wc->destroying;
     wc->destroy_pending = false;
-    
     mutex_unlock(wc->mutex);
     
     if (should_destroy)
         web_server_connection_destroy(wc);
-    
 }
 
 struct sockaddr* web_server_connection_get_local_end_point(struct web_server_connection_t* wc) {
-    
-    return socket_get_local_end_point(wc->socket);
-    
+    return (wc != NULL && wc->socket != NULL) ? socket_get_local_end_point(wc->socket) : NULL;
 }
 
 struct sockaddr* web_server_connection_get_remote_end_point(struct web_server_connection_t* wc) {
-    
-    return socket_get_remote_end_point(wc->socket);
-    
+    return (wc != NULL && wc->socket != NULL) ? socket_get_remote_end_point(wc->socket) : NULL;
 }
 
 const char* web_server_connection_get_host(struct web_server_connection_t* wc) {
-    
-    return sockaddr_get_host(socket_get_remote_end_point(wc->socket));
-    
+    struct sockaddr* end_point = web_server_connection_get_remote_end_point(wc);
+    return end_point != NULL ? sockaddr_get_host(end_point) : NULL;
 }
 
 uint16_t web_server_connection_get_port(struct web_server_connection_t* wc) {
-    
-    return sockaddr_get_port(socket_get_remote_end_point(wc->socket));
-    
+    struct sockaddr* end_point = web_server_connection_get_remote_end_point(wc);
+    return end_point != NULL ? sockaddr_get_port(end_point) : 0;
 }
