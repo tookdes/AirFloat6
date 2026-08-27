@@ -60,24 +60,32 @@ void _web_server_socket_closed(socket_p socket, void* ctx) {
     
     struct web_server_t* ws = (struct web_server_t*)ctx;
     
+    web_server_connection_p web_connection = NULL;
+    bool found = false;
+    
     mutex_lock(ws->mutex);
     
     for (uint32_t i = 0 ; i < ws->connection_count ; i++)
         if (ws->connections[i].socket == socket) {
             
-            web_server_connection_destroy(ws->connections[i].web_connection);
-            //socket_destroy(ws->connections[i].socket);
+            web_connection = ws->connections[i].web_connection;
             
             for (uint32_t x = i ; x < ws->connection_count - 1 ; x++)
                 ws->connections[x] = ws->connections[x + 1];
             
             ws->connection_count--;
+            found = true;
             
             break;
             
         }
     
     mutex_unlock(ws->mutex);
+    
+    if (found) {
+        web_server_connection_destroy(web_connection);
+        socket_destroy(socket);
+    }
     
 }
 
