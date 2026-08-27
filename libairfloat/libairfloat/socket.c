@@ -48,6 +48,9 @@ struct socket_t {
     bool is_udp;
     int socket;
     bool is_connected;
+    bool close_in_progress;
+    bool destroy_pending;
+    bool destroying;
     mutex_p mutex;
     thread_p accept_thread;
     thread_p receive_thread;
@@ -159,12 +162,14 @@ void _socket_receive_loop(void* ctx) {
             read = recvfrom(s->socket, buffer + write_pos, buffer_size - write_pos, 0, (struct sockaddr*) &remote_addr, &remote_addr_len);
             mutex_lock(s->mutex);
             
-            if (s->remote_end_point != NULL) {
-                sockaddr_destroy(s->remote_end_point);
-                s->remote_end_point = NULL;
+            if (read > 0) {
+                if (s->remote_end_point != NULL) {
+                    sockaddr_destroy(s->remote_end_point);
+                    s->remote_end_point = NULL;
+                }
+                
+                s->remote_end_point = sockaddr_copy((struct sockaddr*) &remote_addr);
             }
-            
-            s->remote_end_point = sockaddr_copy((struct sockaddr*) &remote_addr);
             
         } else {
             mutex_unlock(s->mutex);
@@ -242,6 +247,23 @@ struct socket_t* socket_create(const char* name, bool is_udp) {
 }
 
 void socket_destroy(struct socket_t* s) {
+    
+    mutex_lock(s->mutex);
+    
+    if (s->destroying) {
+        mutex_unlock(s->mutex);
+        return;
+    }
+    
+    if (s->close_in_progress) {
+        s->destroy_pending = true;
+        mutex_unlock(s->mutex);
+        return;
+    }
+    
+    s->destroying = true;
+    
+    mutex_unlock(s->mutex);
     
     socket_close(s);
     
@@ -420,37 +442,71 @@ ssize_t socket_send_to(struct socket_t* s, struct sockaddr* end_point, const voi
 
 void socket_close(struct socket_t* s) {
     
+    int socket_fd = -1;
+    thread_p accept_thread = NULL;
+    thread_p receive_thread = NULL;
+    socket_closed_callback closed_callback = NULL;
+    void* closed_callback_ctx = NULL;
+    bool should_notify = false;
+    bool should_close = false;
+    
     mutex_lock(s->mutex);
     
-    if (s->is_connected) {
+    if (s->close_in_progress) {
+        mutex_unlock(s->mutex);
+        return;
+    }
+    
+    if (s->socket >= 0 || s->is_connected || s->accept_thread != NULL || s->receive_thread != NULL) {
         
+        s->close_in_progress = true;
+        should_close = true;
+        should_notify = s->is_connected;
         s->is_connected = false;
-        close(s->socket);
+        
+        socket_fd = s->socket;
         s->socket = -1;
-
-        if (s->accept_thread != NULL) {
-            mutex_unlock(s->mutex);
-            thread_destroy(s->accept_thread);
-            mutex_lock(s->mutex);
-            s->accept_thread = NULL;
-        }
         
-        if (s->receive_thread != NULL) {
-            mutex_unlock(s->mutex);
-            thread_destroy(s->receive_thread);
-            mutex_lock(s->mutex);
-            s->receive_thread = NULL;
-        }
+        accept_thread = s->accept_thread;
+        s->accept_thread = NULL;
         
-        if (s->callbacks.closed) {
-            mutex_unlock(s->mutex);
-            s->callbacks.closed(s, s->callbacks.ctx.closed);
-            mutex_lock(s->mutex);
+        receive_thread = s->receive_thread;
+        s->receive_thread = NULL;
+        
+        if (should_notify) {
+            closed_callback = s->callbacks.closed;
+            closed_callback_ctx = s->callbacks.ctx.closed;
         }
         
     }
     
     mutex_unlock(s->mutex);
+    
+    if (!should_close)
+        return;
+    
+    if (socket_fd >= 0)
+        close(socket_fd);
+    
+    if (accept_thread != NULL)
+        thread_destroy(accept_thread);
+    
+    if (receive_thread != NULL)
+        thread_destroy(receive_thread);
+    
+    if (closed_callback != NULL)
+        closed_callback(s, closed_callback_ctx);
+    
+    mutex_lock(s->mutex);
+    
+    s->close_in_progress = false;
+    bool should_destroy = s->destroy_pending && !s->destroying;
+    s->destroy_pending = false;
+    
+    mutex_unlock(s->mutex);
+    
+    if (should_destroy)
+        socket_destroy(s);
     
 }
 
