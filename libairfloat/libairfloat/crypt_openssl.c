@@ -28,9 +28,11 @@
 //  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <assert.h>
+#include <limits.h>
+#include <pthread.h>
 
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
@@ -44,86 +46,112 @@ struct crypt_aes_t {
     unsigned char iv[16];
 };
 
-RSA* _private_key = NULL;
+static RSA* _private_key = NULL;
+static pthread_once_t _private_key_once = PTHREAD_ONCE_INIT;
 
-RSA* _crypt_apple_private_key() {
+static void _crypt_initialize_apple_private_key(void) {
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (bio == NULL)
+        return;
     
-    if (_private_key == NULL) {
-        BIO* bio = BIO_new(BIO_s_mem());
-        BIO_write(bio, AIRPORT_PRIVATE_KEY_PEM, strlen(AIRPORT_PRIVATE_KEY_PEM));
+    int key_length = (int)strlen(AIRPORT_PRIVATE_KEY_PEM);
+    if (key_length > 0 && BIO_write(bio, AIRPORT_PRIVATE_KEY_PEM, key_length) == key_length)
         _private_key = PEM_read_bio_RSAPrivateKey(bio, NULL, NULL, NULL);
-        BIO_free(bio);
-    }
     
+    BIO_free(bio);
+}
+
+static RSA* _crypt_apple_private_key(void) {
+    pthread_once(&_private_key_once, _crypt_initialize_apple_private_key);
     return _private_key;
-    
 }
 
 size_t crypt_apple_private_encrypt(void* data, size_t data_size, void* encrypted_data, size_t encrypted_data_size) {
     
+    if (data == NULL || encrypted_data == NULL || data_size > INT_MAX)
+        return 0;
+    
     RSA* key = _crypt_apple_private_key();
+    if (key == NULL)
+        return 0;
     
-    assert(encrypted_data_size >= RSA_size(key));
+    int key_size = RSA_size(key);
+    if (key_size <= 0 || data_size != (size_t)key_size || encrypted_data_size < (size_t)key_size)
+        return 0;
     
-    return RSA_private_encrypt((int32_t)data_size, data, encrypted_data, key, RSA_NO_PADDING);
-    
+    int result = RSA_private_encrypt((int)data_size, data, encrypted_data, key, RSA_NO_PADDING);
+    return result > 0 ? (size_t)result : 0;
 }
 
 size_t crypt_apple_private_decrypt(void* encrypted_data, size_t encrypted_data_size, void* data, size_t data_size) {
     
+    if (encrypted_data == NULL || data == NULL || encrypted_data_size > INT_MAX)
+        return 0;
+    
     RSA* key = _crypt_apple_private_key();
+    if (key == NULL)
+        return 0;
     
-    assert(data_size >= RSA_size(key) - 11);
+    int key_size = RSA_size(key);
+    if (key_size <= 0 || encrypted_data_size != (size_t)key_size || data_size < (size_t)key_size)
+        return 0;
     
-    return RSA_private_decrypt((uint32_t)encrypted_data_size, encrypted_data, data, key, RSA_PKCS1_OAEP_PADDING);
-    
+    int result = RSA_private_decrypt((int)encrypted_data_size, encrypted_data, data, key, RSA_PKCS1_OAEP_PADDING);
+    return result > 0 ? (size_t)result : 0;
 }
 
 struct crypt_aes_t* crypt_aes_create(void* key, void* iv, size_t size) {
     
-    assert(size == 16);
+    if (key == NULL || iv == NULL || size != 16)
+        return NULL;
     
     struct crypt_aes_t* d = (struct crypt_aes_t*)malloc(sizeof(struct crypt_aes_t));
-    AES_set_decrypt_key(key, 128, &d->key);
-    memcpy(d->iv, iv, 16);
+    if (d == NULL)
+        return NULL;
+    bzero(d, sizeof(struct crypt_aes_t));
+    
+    if (AES_set_decrypt_key((const unsigned char*)key, 128, &d->key) != 0) {
+        free(d);
+        return NULL;
+    }
+    memcpy(d->iv, iv, sizeof(d->iv));
     
     return d;
-    
 }
 
 void crypt_aes_destroy(struct crypt_aes_t* d) {
     
+    if (d == NULL)
+        return;
+    bzero(d, sizeof(struct crypt_aes_t));
     free(d);
-    
 }
 
 size_t crypt_aes_decrypt(struct crypt_aes_t* d, void* encrypted_data, size_t encrypted_data_size, void* data, size_t data_size) {
     
-    assert(data_size >= encrypted_data_size);
+    if (d == NULL || encrypted_data == NULL || data == NULL || data_size < encrypted_data_size)
+        return 0;
     
     unsigned char iv[16];
-    memcpy(iv, d->iv, 16);
+    memcpy(iv, d->iv, sizeof(iv));
     
-    size_t encrypted_len = encrypted_data_size & ~0xf;
+    size_t encrypted_len = encrypted_data_size & ~(size_t)0xf;
+    memcpy(data, encrypted_data, encrypted_data_size);
     
-    unsigned char ret[encrypted_data_size];
-    memcpy(ret, encrypted_data, encrypted_data_size);
-    
-    AES_cbc_encrypt(encrypted_data, ret, encrypted_len, &d->key, iv, AES_DECRYPT);
-    
-    memcpy(data, ret, encrypted_data_size);
+    if (encrypted_len > 0)
+        AES_cbc_encrypt((const unsigned char*)encrypted_data, (unsigned char*)data, encrypted_len, &d->key, iv, AES_DECRYPT);
     
     return encrypted_data_size;
-    
 }
 
 void crypt_md5_hash(const void* content, size_t content_size, void* md5, size_t md5_size) {
     
-    assert(md5_size >= 16);
+    if (md5 == NULL || md5_size < 16 || (content == NULL && content_size > 0))
+        return;
     
     MD5_CTX context;
     MD5_Init(&context);
-    MD5_Update(&context, content, content_size);
-    MD5_Final(md5, &context);
-    
+    if (content_size > 0)
+        MD5_Update(&context, content, content_size);
+    MD5_Final((unsigned char*)md5, &context);
 }
