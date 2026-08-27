@@ -44,32 +44,48 @@ struct thread_t {
     pthread_t* thread;
 };
 
-
 void* thread_pthread_head(void* ctx) {
     
     struct thread_t* t = (struct thread_t*)ctx;
+    if (t != NULL && t->fnc != NULL)
+        t->fnc(t->ctx);
     
-    t->fnc(t->ctx);
-        
-    pthread_exit(0);
+    return NULL;
     
 }
 
 struct thread_t* thread_create_a(thread_start_fnc start_fnc, void* ctx) {
     
+    if (start_fnc == NULL)
+        return NULL;
+    
     struct thread_t* t = (struct thread_t*)malloc(sizeof(struct thread_t));
+    if (t == NULL)
+        return NULL;
     
     t->fnc = start_fnc;
     t->ctx = ctx;
     t->thread = (pthread_t*)malloc(sizeof(pthread_t));
+    if (t->thread == NULL) {
+        free(t);
+        return NULL;
+    }
     
-    pthread_create(t->thread, NULL, thread_pthread_head, t);
+    int result = pthread_create(t->thread, NULL, thread_pthread_head, t);
+    if (result != 0) {
+        free(t->thread);
+        free(t);
+        return NULL;
+    }
     
     return t;
     
 }
 
 void thread_destroy(struct thread_t* t) {
+    
+    if (t == NULL)
+        return;
     
     if (t->thread != NULL && pthread_equal(pthread_self(), *t->thread)) {
         pthread_detach(*t->thread);
@@ -80,20 +96,20 @@ void thread_destroy(struct thread_t* t) {
     }
     
     thread_join(t);
-    
     free(t);
     
 }
 
 void thread_set_name(const char* name) {
     
-    pthread_setname_np(name);
+    if (name != NULL)
+        pthread_setname_np(name);
     
 }
 
 void thread_join(struct thread_t* t) {
     
-    if (t->thread != NULL) {
+    if (t != NULL && t->thread != NULL) {
         pthread_join(*t->thread, NULL);
         free(t->thread);
         t->thread = NULL;
