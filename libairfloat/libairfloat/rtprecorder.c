@@ -124,10 +124,11 @@ struct rtp_resent_packet_t {
 
 struct rtp_packet_t _rtp_header_read(const void* buffer, size_t size) {
     
-    assert(buffer != NULL && size > 0);
-    
     struct rtp_packet_t ret;
     memset(&ret, 0, sizeof(struct rtp_packet_t));
+    
+    if (buffer == NULL || size < 4)
+        return ret;
     
     char a = ((const char*)buffer)[0];
     char b = ((const char*)buffer)[1];
@@ -227,7 +228,7 @@ void _rtp_recorder_process_sync_packet(struct rtp_recorder_t* rr, struct rtp_pac
     
     uint32_t current_rtp_time = ntohl(*((uint32_t*)packet->packet_data));
     double current_time = _ntp_time_to_hardware_time(*(struct ntp_time*)(packet->packet_data + 4));
-    uint32_t next_rtp_time = ntohl(*((uint32_t*)packet->packet_data + 12));
+    uint32_t next_rtp_time = ntohl(*(uint32_t*)(packet->packet_data + 12));
     
     log_message(LOG_INFO, "Sync packet (Playhead frame: %u - current time: %1.6f - next frame: %u)", current_rtp_time, current_time, next_rtp_time);
     if (rr->updated_track_position_callback != NULL) {
@@ -292,22 +293,23 @@ size_t _rtp_recorder_socket_data_received_airtunes_v1(struct rtp_recorder_t* rr,
     
     while (read < size) {
         
-        if (size < 4)
+        if (size - read < 4)
             break;
         
-        uint16_t packet_size = ntohs(*((uint16_t*)buffer + read + 2));
+        uint16_t packet_size = ntohs(*(uint16_t*)((const char*)buffer + read + 2));
         if (size - read < packet_size + 4)
             break;
         
         read += 4;
         
-        if (((char*)buffer)[read] == '\xf0' && ((char*)buffer)[read + 1] == '\xff') {
+        if (packet_size >= 4 && ((const char*)buffer)[read] == '\xf0' && ((const char*)buffer)[read + 1] == '\xff') {
             
-            struct rtp_packet_t packet = _rtp_header_read(&((char*)&buffer)[read], packet_size);
+            struct rtp_packet_t packet = _rtp_header_read(&((const char*)buffer)[read], packet_size);
             
             packet.seq_num = rr->emulated_seq_no++;
             
-            _rtp_recorder_process_audio_packet(rr, &packet);
+            if (packet.packet_data_size > 8)
+                _rtp_recorder_process_audio_packet(rr, &packet);
             
         }
         
@@ -323,21 +325,28 @@ size_t _rtp_recorder_socket_data_received_airtunes_v1(struct rtp_recorder_t* rr,
 
 size_t _rtp_recorder_socket_data_received_airtunes_v2(struct rtp_recorder_t* rr, rtp_socket_p rtp_socket, socket_p socket, const void* buffer, size_t size) {
     
+    if (buffer == NULL || size < 4)
+        return size;
+    
     struct rtp_packet_t packet = _rtp_header_read(buffer, size);
     
     switch (packet.payload_type) {
         case RTP_TIMING_RESPONSE:
-            _rtp_recorder_process_timing_packet(rr, &packet);
+            if (packet.packet_data_size >= 28)
+                _rtp_recorder_process_timing_packet(rr, &packet);
             break;
         case RTP_SYNC:
-            _rtp_recorder_process_sync_packet(rr, &packet);
+            if (packet.packet_data_size >= 16)
+                _rtp_recorder_process_sync_packet(rr, &packet);
             break;
         case RTP_AUDIO_RESEND_DATA:
-            packet = _rtp_header_read(&((char*)buffer)[4], size - 4);
-            log_message(LOG_INFO, "Received missing packet %d", packet.seq_num);
+            if (size >= 8) {
+                packet = _rtp_header_read(&((const char*)buffer)[4], size - 4);
+                log_message(LOG_INFO, "Received missing packet %d", packet.seq_num);
+            }
             break;
         case RTP_AUDIO_DATA:
-            if (packet.packet_data_size > 0)
+            if (packet.packet_data_size > 8)
                 _rtp_recorder_process_audio_packet(rr, &packet);
             break;
         default:
@@ -406,6 +415,11 @@ struct rtp_recorder_t* rtp_recorder_create(crypt_aes_p crypt, audio_queue_p audi
     rr->control_socket = _rtp_recorder_create_socket(rr, "Control socket", local_end_point, remote_end_point);
     rr->timing_socket = _rtp_recorder_create_socket(rr, "Timing socket", local_end_point, remote_end_point);
     
+    if (rr->streaming_socket == NULL || rr->control_socket == NULL || rr->timing_socket == NULL) {
+        rtp_recorder_destroy(rr);
+        return NULL;
+    }
+    
     rr->updated_track_position_callback = NULL;
     rr->updated_track_position_callback_ctx = NULL;
     
@@ -414,6 +428,9 @@ struct rtp_recorder_t* rtp_recorder_create(crypt_aes_p crypt, audio_queue_p audi
 }
 
 void rtp_recorder_destroy(struct rtp_recorder_t* rr) {
+    
+    if (rr == NULL)
+        return;
     
     mutex_lock(rr->timer_mutex);
     
@@ -428,12 +445,17 @@ void rtp_recorder_destroy(struct rtp_recorder_t* rr) {
     
     mutex_unlock(rr->timer_mutex);
     
-    rtp_socket_destroy(rr->streaming_socket);
-    rtp_socket_destroy(rr->control_socket);
-    rtp_socket_destroy(rr->timing_socket);
+    if (rr->streaming_socket != NULL)
+        rtp_socket_destroy(rr->streaming_socket);
+    if (rr->control_socket != NULL)
+        rtp_socket_destroy(rr->control_socket);
+    if (rr->timing_socket != NULL)
+        rtp_socket_destroy(rr->timing_socket);
     
-    sockaddr_destroy(rr->remote_control_end_point);
-    sockaddr_destroy(rr->remote_timing_end_point);
+    if (rr->remote_control_end_point != NULL)
+        sockaddr_destroy(rr->remote_control_end_point);
+    if (rr->remote_timing_end_point != NULL)
+        sockaddr_destroy(rr->remote_timing_end_point);
     
     mutex_destroy(rr->timer_mutex);
     condition_destroy(rr->timer_cond);
@@ -443,6 +465,9 @@ void rtp_recorder_destroy(struct rtp_recorder_t* rr) {
 }
 
 bool rtp_recorder_start(struct rtp_recorder_t* rr) {
+    
+    if (rr == NULL)
+        return false;
     
     bool complete = true;
     
@@ -475,23 +500,31 @@ bool rtp_recorder_start(struct rtp_recorder_t* rr) {
 
 uint16_t rtp_recorder_get_streaming_port(struct rtp_recorder_t* rr) {
     
+    if (rr == NULL || rr->streaming_socket == NULL)
+        return 0;
     return rtp_socket_get_local_port(rr->streaming_socket);
     
 }
 
 uint16_t rtp_recorder_get_control_port(struct rtp_recorder_t* rr) {
     
+    if (rr == NULL || rr->control_socket == NULL)
+        return 0;
     return rtp_socket_get_local_port(rr->control_socket);
     
 }
 
 uint16_t rtp_recorder_get_timing_port(struct rtp_recorder_t* rr) {
     
+    if (rr == NULL || rr->timing_socket == NULL)
+        return 0;
     return rtp_socket_get_local_port(rr->timing_socket);
     
 }
 
 void rtp_recorder_set_updated_track_position_callback(struct rtp_recorder_t* rr, rtp_recorder_updated_track_position_callback callback, void* ctx) {
+    if (rr == NULL)
+        return;
     rr->updated_track_position_callback = callback;
     rr->updated_track_position_callback_ctx = ctx;
 }
