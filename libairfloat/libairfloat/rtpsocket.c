@@ -149,16 +149,32 @@ static struct rtp_socket_info_t* _rtp_socket_detach_socket(struct rtp_socket_t* 
     return info;
 }
 
-static void _rtp_socket_configure_socket(struct rtp_socket_t* rs, struct rtp_socket_info_t* info) {
+static bool _rtp_socket_configure_socket(struct rtp_socket_t* rs, struct rtp_socket_info_t* info) {
     
     if (rs == NULL || info == NULL || info->socket == NULL)
-        return;
+        return false;
     
     /* Install the close callback before starting a receive worker so an
        immediate peer disconnect cannot leave an untracked socket behind. */
     socket_set_closed_callback(info->socket, _rtp_socket_socket_closed_callback, rs);
     if (info->is_data_socket)
-        socket_set_receive_callback(info->socket, _rtp_socket_socket_receive_callback, rs);
+        return socket_set_receive_callback(info->socket, _rtp_socket_socket_receive_callback, rs);
+    
+    return true;
+}
+
+static void _rtp_socket_rollback_setup_socket(struct rtp_socket_t* rs, socket_p socket) {
+    
+    if (socket == NULL)
+        return;
+    
+    struct rtp_socket_info_t* info = _rtp_socket_detach_socket(rs, socket);
+    if (info != NULL)
+        free(info);
+    
+    /* The close callback may still run while socket_destroy joins a worker.
+       With the info already detached it becomes a harmless no-op. */
+    socket_destroy(socket);
 }
 
 void rtp_socket_destroy(struct rtp_socket_t* rs) {
@@ -264,7 +280,14 @@ bool _rtp_socket_accept_callback(socket_p socket, socket_p new_socket, void* ctx
     if (info == NULL)
         return false;
     
-    _rtp_socket_configure_socket(rs, info);
+    if (!_rtp_socket_configure_socket(rs, info)) {
+        struct rtp_socket_info_t* detached = _rtp_socket_detach_socket(rs, new_socket);
+        if (detached != NULL)
+            free(detached);
+        log_message(LOG_ERROR, "Unable to start accepted RTP receive worker");
+        return false;
+    }
+    
     return true;
 }
 
@@ -303,9 +326,18 @@ bool rtp_socket_setup(struct rtp_socket_t* rs, struct sockaddr* local_end_point)
         return false;
     }
     
-    _rtp_socket_configure_socket(rs, udp_info);
-    _rtp_socket_configure_socket(rs, tcp_info);
-    socket_set_accept_callback(tcp_socket, _rtp_socket_accept_callback, rs);
+    bool success = _rtp_socket_configure_socket(rs, udp_info);
+    if (success)
+        success = _rtp_socket_configure_socket(rs, tcp_info);
+    if (success)
+        success = socket_set_accept_callback(tcp_socket, _rtp_socket_accept_callback, rs);
+    
+    if (!success) {
+        log_message(LOG_ERROR, "Unable to start RTP socket workers");
+        _rtp_socket_rollback_setup_socket(rs, udp_socket);
+        _rtp_socket_rollback_setup_socket(rs, tcp_socket);
+        return false;
+    }
     
     return true;
 }
