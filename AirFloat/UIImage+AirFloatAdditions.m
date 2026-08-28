@@ -103,8 +103,12 @@
             
             CGImageRef outImage = [ciContext createCGImage:outputImage
                                                   fromRect:[inputImage extent]];
+            if (outImage == NULL)
+                return nil;
             
-            return [UIImage imageWithCGImage:outImage];
+            UIImage* result = [UIImage imageWithCGImage:outImage];
+            CGImageRelease(outImage);
+            return result;
             
         }
         @catch (NSException *exception) {
