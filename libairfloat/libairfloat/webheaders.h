@@ -32,6 +32,7 @@
 #define __webheaders_h
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct web_headers_t *web_headers_p;
 
@@ -43,6 +44,17 @@ const char* web_headers_name(web_headers_p wh, uint32_t index);
 uint32_t web_headers_count(web_headers_p wh);
 size_t web_headers_parse(web_headers_p wh, void* buffer, size_t size);
 void web_headers_set_value(web_headers_p wh, const char* name, const char* value, ...);
+
+/* Use this for values that are already complete strings, especially values
+   originating from network input. web_headers_set_value() treats its value
+   argument as a printf format string. */
+static inline void web_headers_set_literal_value(web_headers_p wh, const char* name, const char* value) {
+    if (value == NULL)
+        web_headers_set_value(wh, name, NULL);
+    else
+        web_headers_set_value(wh, name, "%s", value);
+}
+
 size_t web_headers_write(web_headers_p wh, void* data, size_t data_size);
 
 #endif
