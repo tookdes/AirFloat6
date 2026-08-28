@@ -37,17 +37,20 @@
 
 static pthread_key_t _sockaddr_host_key;
 static pthread_once_t _sockaddr_host_key_once = PTHREAD_ONCE_INIT;
+static int _sockaddr_host_key_result = -1;
 
 static void _sockaddr_destroy_host_buffer(void* buffer) {
     free(buffer);
 }
 
 static void _sockaddr_create_host_key(void) {
-    pthread_key_create(&_sockaddr_host_key, _sockaddr_destroy_host_buffer);
+    _sockaddr_host_key_result = pthread_key_create(&_sockaddr_host_key, _sockaddr_destroy_host_buffer);
 }
 
 static char* _sockaddr_get_host_buffer(void) {
     pthread_once(&_sockaddr_host_key_once, _sockaddr_create_host_key);
+    if (_sockaddr_host_key_result != 0)
+        return NULL;
     
     char* buffer = (char*)pthread_getspecific(_sockaddr_host_key);
     if (buffer != NULL)
