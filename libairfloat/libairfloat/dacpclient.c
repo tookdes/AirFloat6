@@ -217,7 +217,7 @@ void _dacp_client_send_request(struct dacp_client_t* dc, const char* request_nam
     free(path);
     
     if (dc->active_remove != NULL)
-        web_headers_set_value(web_request_get_headers(request), "Active-Remote", dc->active_remove);
+        web_headers_set_literal_value(web_request_get_headers(request), "Active-Remote", dc->active_remove);
     
     web_client_connection_send_request(dc->web_connection, request);
     web_request_destroy(request);
