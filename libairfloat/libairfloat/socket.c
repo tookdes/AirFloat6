@@ -158,6 +158,12 @@ void _socket_accept_loop(void* ctx) {
     _socket_set_loop_name(s, "Accept Loop");
     
     s->accept_loop_active = true;
+    if (s->socket < 0 || s->destroy_pending || s->destroying || s->close_in_progress) {
+        mutex_unlock(s->mutex);
+        socket_close(s);
+        _socket_worker_finished(s, true);
+        return;
+    }
     s->is_connected = true;
     
     int new_socket_fd = 0;
@@ -219,6 +225,12 @@ void _socket_receive_loop(void* ctx) {
     _socket_set_loop_name(s, "Receive Loop");
     
     s->receive_loop_active = true;
+    if (s->socket < 0 || s->destroy_pending || s->destroying || s->close_in_progress) {
+        mutex_unlock(s->mutex);
+        socket_close(s);
+        _socket_worker_finished(s, false);
+        return;
+    }
     s->is_connected = true;
     
     void* buffer = NULL;
@@ -310,25 +322,79 @@ void _socket_receive_loop(void* ctx) {
 void _socket_connect(void* ctx) {
     
     struct socket_t* s = (struct socket_t*)ctx;
-    if (s == NULL || s->remote_end_point == NULL || s->socket < 0)
+    if (s == NULL)
         return;
     
-    if (!connect(s->socket, s->remote_end_point, s->remote_end_point->sa_len)) {
-        
-        if (s->callbacks.connected != NULL)
-            s->callbacks.connected(s, s->callbacks.ctx.connected);
-        
-        _socket_receive_loop(ctx);
-        
-    } else {
-        
-        log_message(LOG_ERROR, "Unable to connect (%s)", strerror(errno));
-        
-        if (s->callbacks.connect_failed != NULL)
-            s->callbacks.connect_failed(s, s->callbacks.ctx.connect_failed);
-        
+    mutex_lock(s->mutex);
+    _socket_set_loop_name(s, "Connect Loop");
+    s->receive_loop_active = true;
+    
+    int socket_fd = s->socket;
+    struct sockaddr* remote_end_point = s->remote_end_point != NULL ? sockaddr_copy(s->remote_end_point) : NULL;
+    bool can_connect = socket_fd >= 0 && remote_end_point != NULL &&
+                       !s->destroy_pending && !s->destroying && !s->close_in_progress;
+    mutex_unlock(s->mutex);
+    
+    if (!can_connect) {
+        if (remote_end_point != NULL)
+            sockaddr_destroy(remote_end_point);
+        socket_close(s);
+        _socket_worker_finished(s, false);
+        return;
     }
     
+    int connect_result = connect(socket_fd, remote_end_point, remote_end_point->sa_len);
+    int connect_error = errno;
+    sockaddr_destroy(remote_end_point);
+    
+    if (connect_result == 0) {
+        socket_connected_callback connected_callback = NULL;
+        void* connected_callback_ctx = NULL;
+        
+        mutex_lock(s->mutex);
+        if (s->socket == socket_fd && !s->destroy_pending && !s->destroying && !s->close_in_progress) {
+            /* Report the socket as connected before notifying the client so a
+               request sent from its connected callback is not discarded. */
+            s->is_connected = true;
+            connected_callback = s->callbacks.connected;
+            connected_callback_ctx = s->callbacks.ctx.connected;
+        }
+        mutex_unlock(s->mutex);
+        
+        if (connected_callback != NULL)
+            connected_callback(s, connected_callback_ctx);
+        
+        mutex_lock(s->mutex);
+        bool should_receive = s->socket == socket_fd && s->is_connected &&
+                              !s->destroy_pending && !s->destroying && !s->close_in_progress;
+        mutex_unlock(s->mutex);
+        
+        if (should_receive) {
+            _socket_receive_loop(ctx);
+            return;
+        }
+    } else {
+        socket_connect_failed_callback connect_failed_callback = NULL;
+        void* connect_failed_callback_ctx = NULL;
+        
+        mutex_lock(s->mutex);
+        bool should_notify = s->socket == socket_fd && !s->destroy_pending && !s->destroying && !s->close_in_progress;
+        if (should_notify) {
+            connect_failed_callback = s->callbacks.connect_failed;
+            connect_failed_callback_ctx = s->callbacks.ctx.connect_failed;
+        }
+        mutex_unlock(s->mutex);
+        
+        if (should_notify)
+            log_message(LOG_ERROR, "Unable to connect (%s)", strerror(connect_error));
+        if (connect_failed_callback != NULL)
+            connect_failed_callback(s, connect_failed_callback_ctx);
+    }
+    
+    /* A failed connection or a callback-triggered close ends this worker.
+       Closing also clears the thread handle so a later connect gets a fresh fd. */
+    socket_close(s);
+    _socket_worker_finished(s, false);
 }
 
 struct socket_t* socket_create(const char* name, bool is_udp) {
