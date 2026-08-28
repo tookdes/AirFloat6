@@ -295,11 +295,8 @@ void _rtp_recorder_process_audio_packet(struct rtp_recorder_t* rr, struct rtp_pa
     else
         memcpy(decoded_audio_data, packet_audio_data, len);
     
-    if (len > 0) {
-        uint16_t missing_count = audio_queue_add_packet(rr->audio_queue, decoded_audio_data, len, c_seq, rtp_time);
-        if (missing_count > 0)
-            _rtp_recorder_send_resend_request(rr, (uint16_t)(c_seq - missing_count), missing_count);
-    }
+    if (len > 0)
+        audio_queue_add_packet(rr->audio_queue, decoded_audio_data, len, c_seq, rtp_time);
     
     free(decoded_audio_data);
     
