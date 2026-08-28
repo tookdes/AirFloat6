@@ -196,7 +196,7 @@ void _rtp_recorder_process_timing_packet(struct rtp_recorder_t* rr, struct rtp_p
     mutex_lock(rr->timer_mutex);
     if (!rr->destroying) {
         rr->initial_time_response_count++;
-        if (rr->initial_time_response_count >= 2)
+        if (rr->initial_time_response_count == 2)
             condition_signal(rr->timer_cond);
     }
     mutex_unlock(rr->timer_mutex);
