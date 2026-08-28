@@ -302,6 +302,7 @@ struct zeroconf_dacp_discover_t {
     mutex_p mutex;
     condition_p condition;
     bool run_loop_ready;
+    bool browse_start_failed;
     bool destroying;
     zeroconf_dacp_discover_service_found_callback service_found_callback;
     void* service_found_callback_ctx;
@@ -449,8 +450,13 @@ void _zeroconf_dacp_discover_resolve_callback(CFNetServiceRef service, CFStreamE
 
 void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFOptionFlags flags, CFTypeRef domainOrService, CFStreamError* error, void* info) {
     struct zeroconf_dacp_discover_t* zd = (struct zeroconf_dacp_discover_t*)info;
-    if (zd == NULL || browser == NULL || domainOrService == NULL || (error != NULL && error->error != 0))
+    if (zd == NULL || browser == NULL || domainOrService == NULL)
         return;
+    
+    if (error != NULL && error->error != 0) {
+        log_message(LOG_ERROR, "Zeroconf browse error (domain %d / error %d)", (int)error->domain, (int)error->error);
+        return;
+    }
     
     mutex_lock(zd->mutex);
     bool destroying = zd->destroying;
@@ -485,8 +491,10 @@ void _zeroconf_dacp_discover_browse_callback(CFNetServiceBrowserRef browser, CFO
         mutex_unlock(zd->mutex);
         
         if (run_loop != NULL) {
+            CFStreamError search_error = { 0, 0 };
             CFNetServiceBrowserScheduleWithRunLoop(service_browser, run_loop, kCFRunLoopCommonModes);
-            CFNetServiceBrowserSearchForServices(service_browser, (CFStringRef)domainOrService, CFSTR("_dacp._tcp."), NULL);
+            if (!CFNetServiceBrowserSearchForServices(service_browser, (CFStringRef)domainOrService, CFSTR("_dacp._tcp."), &search_error))
+                log_message(LOG_ERROR, "Unable to start DACP service browse (domain %d / error %d)", (int)search_error.domain, (int)search_error.error);
         }
         
         char domain_name[256];
@@ -587,22 +595,32 @@ void _zeroconf_dacp_discover_run_loop_thread(void* ctx) {
     zd->run_loop = run_loop;
     mutex_unlock(zd->mutex);
     
+    CFStreamError browse_error = { 0, 0 };
     CFNetServiceBrowserScheduleWithRunLoop(zd->domain_browser, run_loop, kCFRunLoopCommonModes);
-    CFNetServiceBrowserSearchForDomains(zd->domain_browser, FALSE, NULL);
+    Boolean browse_started = CFNetServiceBrowserSearchForDomains(zd->domain_browser, FALSE, &browse_error);
     
-    CFRunLoopTimerContext timer_context = { 0, zd, NULL, NULL, NULL };
-    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .02, 0, 0, 0, _zeroconf_dacp_discover_run_loop_ready, &timer_context);
-    if (timer != NULL) {
-        CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
-        CFRelease(timer);
-    } else {
+    if (!browse_started) {
         mutex_lock(zd->mutex);
+        zd->browse_start_failed = true;
         zd->run_loop_ready = true;
         condition_signal(zd->condition);
         mutex_unlock(zd->mutex);
+        log_message(LOG_ERROR, "Unable to start DACP domain browse (domain %d / error %d)", (int)browse_error.domain, (int)browse_error.error);
+    } else {
+        CFRunLoopTimerContext timer_context = { 0, zd, NULL, NULL, NULL };
+        CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .02, 0, 0, 0, _zeroconf_dacp_discover_run_loop_ready, &timer_context);
+        if (timer != NULL) {
+            CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
+            CFRelease(timer);
+        } else {
+            mutex_lock(zd->mutex);
+            zd->run_loop_ready = true;
+            condition_signal(zd->condition);
+            mutex_unlock(zd->mutex);
+        }
+        
+        CFRunLoopRun();
     }
-    
-    CFRunLoopRun();
     
     CFNetServiceBrowserUnscheduleFromRunLoop(zd->domain_browser, run_loop, kCFRunLoopCommonModes);
     CFNetServiceBrowserInvalidate(zd->domain_browser);
@@ -699,29 +717,35 @@ void zeroconf_dacp_discover_destroy(struct zeroconf_dacp_discover_t* zd) {
     free(zd);
 }
 
-void zeroconf_dacp_discover_set_callback(struct zeroconf_dacp_discover_t* zd, zeroconf_dacp_discover_service_found_callback callback, void* ctx) {
+bool zeroconf_dacp_discover_set_callback(struct zeroconf_dacp_discover_t* zd, zeroconf_dacp_discover_service_found_callback callback, void* ctx) {
     if (zd == NULL)
-        return;
+        return false;
     
     mutex_lock(zd->mutex);
     if (zd->destroying) {
         mutex_unlock(zd->mutex);
-        return;
+        return false;
     }
     
     zd->service_found_callback = callback;
     zd->service_found_callback_ctx = ctx;
     
+    bool success = true;
     if (callback != NULL && zd->thread == NULL) {
         zd->run_loop_ready = false;
+        zd->browse_start_failed = false;
         zd->thread = thread_create_a(_zeroconf_dacp_discover_run_loop_thread, zd);
-        if (zd->thread != NULL) {
+        if (zd->thread == NULL)
+            success = false;
+        else {
             while (!zd->run_loop_ready)
                 condition_wait(zd->condition, zd->mutex);
+            success = !zd->browse_start_failed;
         }
     }
     
     mutex_unlock(zd->mutex);
+    return success;
 }
 
 #endif
