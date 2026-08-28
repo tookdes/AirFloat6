@@ -121,7 +121,10 @@ void clientStartedRecording(raop_session_p raop_session, void* ctx) {
         
         NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
         
-        [viewController performSelectorOnMainThread:@selector(setDacpClient:) withObject:[NSValue valueWithPointer:client] waitUntilDone:NO];
+        /* Pair the raw DACP pointer handoff with the synchronous teardown
+           cleanup. This prevents a delayed main-thread selector from writing
+           a freed DACP pointer back after an immediate disconnect. */
+        [viewController performSelectorOnMainThread:@selector(setDacpClient:) withObject:[NSValue valueWithPointer:client] waitUntilDone:YES];
         
         [pool release];
         
