@@ -30,7 +30,7 @@
 
 #include <string.h>
 #include <stdlib.h>
-#include <assert.h>
+#include <stdint.h>
 
 #include "base64.h"
 
@@ -49,15 +49,23 @@ size_t base64_encode(const void *data, size_t size, char **str) {
     if (data == NULL || str == NULL)
         return (size_t)-1;
     
+    *str = NULL;
+    if (size > SIZE_MAX - 2)
+        return (size_t)-1;
+    size_t groups = (size + 2) / 3;
+    if (groups > (SIZE_MAX - 1) / 4)
+        return (size_t)-1;
+    size_t encoded_capacity = groups * 4 + 1;
+    
     char *s, *p;
     size_t i;
     int c;
     const unsigned char *q;
     
-    p = s = (char *) malloc(size * 4 / 3 + 4);
+    p = s = (char *)malloc(encoded_capacity);
     if (p == NULL)
         return (size_t)-1;
-    q = (const unsigned char *) data;
+    q = (const unsigned char *)data;
     for (i = 0; i < size;) {
         c = q[i++];
         c *= 256;
@@ -78,9 +86,9 @@ size_t base64_encode(const void *data, size_t size, char **str) {
             p[2] = '=';
         p += 4;
     }
-    *p = 0;
+    *p = '\0';
     *str = s;
-    return strlen(s);
+    return (size_t)(p - s);
     
 }
 
@@ -148,6 +156,8 @@ size_t base64_pad(const char* base64, size_t base64_size, char* out, size_t out_
     
     size_t remainder = base64_size % 4;
     size_t padding = (4 - remainder) % 4;
+    if (base64_size > SIZE_MAX - padding - 1)
+        return 0;
     size_t required_size = base64_size + padding + 1;
     
     if (out_size < required_size)
