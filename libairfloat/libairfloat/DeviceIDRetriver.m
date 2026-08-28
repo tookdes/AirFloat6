@@ -9,13 +9,11 @@ uint64_t iOSDeviceID() {
     
     uint64_t returned = 0;
     
-    // get ID string
-    NSString *idString = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    
-    // convert to data, then store sufficient data into uint64_t.
-    // this is a crude NSString -> uint64_t hash
+    NSUUID *identifier = [[UIDevice currentDevice] identifierForVendor];
+    NSString *idString = [identifier UUIDString];
     NSData *idData = [idString dataUsingEncoding:NSUTF8StringEncoding];
-    [idData getBytes:&returned length:sizeof(uint64_t)];
+    if (idData != nil && [idData length] >= sizeof(returned))
+        [idData getBytes:&returned length:sizeof(returned)];
     
     return returned;
 }
