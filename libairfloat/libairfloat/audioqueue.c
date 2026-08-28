@@ -648,7 +648,7 @@ uint32_t audio_queue_add_packet(struct audio_queue_t* aq, void* encoded_buffer, 
         return 0;
     }
     
-    if (aq->flushed && (seq_no >= aq->flush_last_seq_no || (IS_LOWER(seq_no) && IS_UPPER(aq->flush_last_seq_no)))) {
+    if (aq->flushed && (int16_t)(uint16_t)(seq_no - aq->flush_last_seq_no) >= 0) {
         aq->flushed = false;
         aq->flush_last_seq_no = 0;
     }
