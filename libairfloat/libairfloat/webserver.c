@@ -143,17 +143,24 @@ bool _web_server_socket_accept_callback(socket_p socket, socket_p new_socket, vo
     if (ws == NULL || new_socket == NULL)
         return false;
     
-    web_server_connection_p new_web_connection = web_server_connection_create(new_socket, ws);
-    if (new_web_connection == NULL)
-        return false;
-    
     web_server_accept_callback accept_callback = NULL;
     void* accept_callback_ctx = NULL;
     
+    /* Listener threads may already exist for a moment while start/stop is
+       changing server state. Do not create a RAOP session unless the server
+       is fully running. */
     mutex_lock(ws->mutex);
+    if (!ws->is_running) {
+        mutex_unlock(ws->mutex);
+        return false;
+    }
     accept_callback = ws->accept_callback;
     accept_callback_ctx = ws->accept_callback_ctx;
     mutex_unlock(ws->mutex);
+    
+    web_server_connection_p new_web_connection = web_server_connection_create(new_socket, ws);
+    if (new_web_connection == NULL)
+        return false;
     
     bool should_live = false;
     if (accept_callback != NULL)
@@ -179,14 +186,30 @@ bool _web_server_socket_accept_callback(socket_p socket, socket_p new_socket, vo
     }
     
     ws->connections = connections;
-    ws->connections[ws->connection_count].web_connection = new_web_connection;
-    ws->connections[ws->connection_count].socket = new_socket;
+    uint32_t connection_index = ws->connection_count;
+    ws->connections[connection_index].web_connection = new_web_connection;
+    ws->connections[connection_index].socket = new_socket;
     ws->connection_count++;
     
     socket_set_closed_callback(new_socket, _web_server_socket_closed, ws);
-    web_server_connection_take_off(new_web_connection);
-    mutex_unlock(ws->mutex);
+    bool receive_started = web_server_connection_take_off(new_web_connection);
     
+    if (!receive_started) {
+        /* No receive worker exists, so remove the entry while this callback
+           still owns it. The parent accept loop will destroy the socket object
+           after we return false. */
+        socket_set_closed_callback(new_socket, NULL, NULL);
+        ws->connection_count--;
+        if (ws->connection_count == 0) {
+            free(ws->connections);
+            ws->connections = NULL;
+        }
+        mutex_unlock(ws->mutex);
+        web_server_connection_destroy(new_web_connection);
+        return false;
+    }
+    
+    mutex_unlock(ws->mutex);
     return true;
 }
 
@@ -215,21 +238,22 @@ bool web_server_start(struct web_server_t* ws, uint16_t port) {
     bool success = (((ws->socket_types & sockaddr_type_inet_4) == 0 || socket_ipv4 != NULL) &&
                     ((ws->socket_types & sockaddr_type_inet_6) == 0 || socket_ipv6 != NULL));
     
+    if (success && socket_ipv4 != NULL)
+        success = socket_set_accept_callback(socket_ipv4, _web_server_socket_accept_callback, ws);
+    if (success && socket_ipv6 != NULL)
+        success = socket_set_accept_callback(socket_ipv6, _web_server_socket_accept_callback, ws);
+    
     if (success) {
         ws->socket_ipv4 = socket_ipv4;
         ws->socket_ipv6 = socket_ipv6;
-        
-        if (socket_ipv4 != NULL)
-            socket_set_accept_callback(socket_ipv4, _web_server_socket_accept_callback, ws);
-        if (socket_ipv6 != NULL)
-            socket_set_accept_callback(socket_ipv6, _web_server_socket_accept_callback, ws);
-        
         ws->is_running = true;
         mutex_unlock(ws->mutex);
         log_message(LOG_INFO, "Server started.");
         return true;
     }
     
+    /* An already-started listener may be blocked in its accept callback on
+       ws->mutex. Release the mutex before closing/joining listener workers. */
     mutex_unlock(ws->mutex);
     
     if (socket_ipv4 != NULL)
