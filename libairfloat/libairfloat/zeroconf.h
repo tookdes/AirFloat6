@@ -32,6 +32,7 @@
 #define _zeroconf_h
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "sockaddr.h"
 
@@ -46,6 +47,6 @@ typedef void(*zeroconf_dacp_discover_service_found_callback)(zeroconf_dacp_disco
 
 zeroconf_dacp_discover_p zeroconf_dacp_discover_create();
 void zeroconf_dacp_discover_destroy(zeroconf_dacp_discover_p zd);
-void zeroconf_dacp_discover_set_callback(zeroconf_dacp_discover_p zd, zeroconf_dacp_discover_service_found_callback callback, void* ctx);
+bool zeroconf_dacp_discover_set_callback(zeroconf_dacp_discover_p zd, zeroconf_dacp_discover_service_found_callback callback, void* ctx);
 
 #endif
