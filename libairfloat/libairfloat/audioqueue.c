@@ -218,7 +218,6 @@ void _audio_queue_debug_check_queue_consistancy(struct audio_queue_t* aq) {
     
     if (aq->queue_head != NULL) {
         uint16_t c_seq_no = aq->queue_head->seq_no + 1;
-        size_t c_sample_time = aq->queue_head->sample_time + (aq->queue_head->buffer_size / aq->output_format.frame_size);
         frame_count = ((uint32_t)aq->queue_head->buffer_size / aq->output_format.frame_size);
         
         queue_count++;
@@ -227,14 +226,17 @@ void _audio_queue_debug_check_queue_consistancy(struct audio_queue_t* aq) {
         
         LOOP_FROM(current_packet, aq->queue_head->next, next, NULL) {
             assert(current_packet->seq_no == c_seq_no /* Package has bad seq no. */);
-            assert(current_packet->sample_time == c_sample_time /* Package has bad sample time */);
+            
+            /* Packet RTP timestamps need not equal the previous packet's
+               timestamp plus its decoded frame count. Apple TV can vary
+               packet framing within one stream; Release builds already
+               tolerate this, so the debug consistency check must not abort. */
             
             if (current_packet->state != audio_packet_state_complete)
                 missing_count++;
             queue_count++;
             
             c_seq_no++;
-            c_sample_time += (current_packet->buffer_size / aq->output_format.frame_size);
             frame_count += (current_packet->buffer_size / aq->output_format.frame_size);
         }
     }
