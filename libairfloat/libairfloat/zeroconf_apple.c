@@ -46,6 +46,8 @@
 
 #include "zeroconf.h"
 
+#define ZEROCONF_REGISTRATION_TIMEOUT_MS 5000
+
 static bool _zeroconf_cfstring_to_cstring(CFStringRef string, char* buffer, size_t buffer_size) {
     if (string == NULL || buffer == NULL || buffer_size == 0)
         return false;
@@ -59,7 +61,8 @@ struct zeroconf_raop_ad_t {
     thread_p thread;
     mutex_p mutex;
     condition_p condition;
-    bool run_loop_ready;
+    bool registration_complete;
+    bool registration_succeeded;
     uint16_t port;
 };
 
@@ -70,23 +73,18 @@ void _zeroconf_raop_ad_callback(CFNetServiceRef theService, CFStreamError* error
     if (za == NULL)
         return;
     
-    if (error == NULL || error->error == 0)
-        log_message(LOG_INFO, "Zeroconf advertising started on port %d", za->port);
-    else
-        log_message(LOG_ERROR, "Could not start Zeroconf advertisement.");
-}
-
-void _zeroconf_raop_ad_run_loop_ready(CFRunLoopTimerRef timer, void *info) {
-    struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)info;
-    if (za == NULL)
-        return;
+    bool succeeded = (error == NULL || error->error == 0);
     
     mutex_lock(za->mutex);
-    za->run_loop_ready = true;
+    za->registration_complete = true;
+    za->registration_succeeded = succeeded;
     condition_signal(za->condition);
     mutex_unlock(za->mutex);
     
-    log_message(LOG_INFO, "Run loop ready");
+    if (succeeded)
+        log_message(LOG_INFO, "Zeroconf advertising started on port %d", za->port);
+    else
+        log_message(LOG_ERROR, "Could not start Zeroconf advertisement (domain %d / error %d)", (int)error->domain, (int)error->error);
 }
 
 void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
@@ -98,32 +96,39 @@ void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
     
     CFRunLoopRef run_loop = CFRunLoopGetCurrent();
     
-    CFNetServiceClientContext context = { 0, za, NULL, NULL, NULL };
-    CFNetServiceSetClient(za->service, _zeroconf_raop_ad_callback, &context);
-    CFNetServiceScheduleWithRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
-    CFNetServiceRegisterWithOptions(za->service, kCFNetServiceFlagNoAutoRename, NULL);
-    
     mutex_lock(za->mutex);
     za->run_loop = run_loop;
     mutex_unlock(za->mutex);
     
-    CFRunLoopTimerContext timer_context = { 0, za, NULL, NULL, NULL };
-    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + .02, 0, 0, 0, _zeroconf_raop_ad_run_loop_ready, &timer_context);
-    if (timer != NULL) {
-        CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
-        CFRelease(timer);
-    } else {
-        mutex_lock(za->mutex);
-        za->run_loop_ready = true;
-        condition_signal(za->condition);
-        mutex_unlock(za->mutex);
+    CFNetServiceClientContext context = { 0, za, NULL, NULL, NULL };
+    Boolean client_set = CFNetServiceSetClient(za->service, _zeroconf_raop_ad_callback, &context);
+    
+    CFStreamError registration_error = { 0, 0 };
+    Boolean registration_started = false;
+    if (client_set) {
+        CFNetServiceScheduleWithRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
+        registration_started = CFNetServiceRegisterWithOptions(za->service, kCFNetServiceFlagNoAutoRename, &registration_error);
     }
     
-    CFRunLoopRun();
+    if (!registration_started) {
+        mutex_lock(za->mutex);
+        za->registration_complete = true;
+        za->registration_succeeded = false;
+        condition_signal(za->condition);
+        mutex_unlock(za->mutex);
+        
+        if (!client_set)
+            log_message(LOG_ERROR, "Unable to install Zeroconf registration callback");
+        else
+            log_message(LOG_ERROR, "Unable to start Zeroconf registration (domain %d / error %d)", (int)registration_error.domain, (int)registration_error.error);
+    } else
+        CFRunLoopRun();
     
-    CFNetServiceUnscheduleFromRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
-    CFNetServiceSetClient(za->service, NULL, NULL);
-    CFNetServiceCancel(za->service);
+    if (client_set) {
+        CFNetServiceUnscheduleFromRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
+        CFNetServiceSetClient(za->service, NULL, NULL);
+        CFNetServiceCancel(za->service);
+    }
     
     mutex_lock(za->mutex);
     za->run_loop = NULL;
@@ -181,13 +186,18 @@ struct zeroconf_raop_ad_t* zeroconf_raop_ad_create(uint16_t port, const char *na
     if (txt_dictionary != NULL)
         txt_data = CFNetServiceCreateTXTDataWithDictionary(kCFAllocatorDefault, txt_dictionary);
     
-    if (txt_data != NULL)
-        CFNetServiceSetTXTData(za->service, txt_data);
+    bool txt_configured = (txt_data != NULL && CFNetServiceSetTXTData(za->service, txt_data));
     
     if (txt_data != NULL)
         CFRelease(txt_data);
     if (txt_dictionary != NULL)
         CFRelease(txt_dictionary);
+    
+    if (!txt_configured) {
+        CFRelease(za->service);
+        free(za);
+        return NULL;
+    }
     
     za->mutex = mutex_create();
     za->condition = condition_create();
@@ -211,9 +221,23 @@ struct zeroconf_raop_ad_t* zeroconf_raop_ad_create(uint16_t port, const char *na
         free(za);
         return NULL;
     }
-    while (!za->run_loop_ready)
-        condition_wait(za->condition, za->mutex);
+    
+    bool timed_out = false;
+    while (!za->registration_complete) {
+        if (condition_times_wait(za->condition, za->mutex, ZEROCONF_REGISTRATION_TIMEOUT_MS)) {
+            timed_out = true;
+            break;
+        }
+    }
+    bool registration_succeeded = za->registration_complete && za->registration_succeeded;
     mutex_unlock(za->mutex);
+    
+    if (!registration_succeeded) {
+        if (timed_out)
+            log_message(LOG_ERROR, "Timed out waiting for Zeroconf registration");
+        zeroconf_raop_ad_destroy(za);
+        return NULL;
+    }
     
     log_message(LOG_INFO, "Zeroconf configured");
     return za;
