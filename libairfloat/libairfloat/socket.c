@@ -646,8 +646,26 @@ ssize_t socket_send(struct socket_t* s, const void* buffer, size_t size) {
     
     mutex_lock(s->mutex);
     
-    if (s->is_connected && s->socket >= 0)
-        ret = send(s->socket, buffer, size, 0);
+    if (s->is_connected && s->socket >= 0) {
+        const char* bytes = (const char*)buffer;
+        size_t sent = 0;
+        
+        while (sent < size) {
+            ssize_t written = send(s->socket, bytes + sent, size - sent, 0);
+            if (written > 0) {
+                sent += (size_t)written;
+                continue;
+            }
+            if (written < 0 && errno == EINTR)
+                continue;
+            
+            ret = (sent > 0 ? (ssize_t)sent : (written < 0 ? -1 : 0));
+            break;
+        }
+        
+        if (sent == size)
+            ret = (ssize_t)sent;
+    }
     
     mutex_unlock(s->mutex);
     
