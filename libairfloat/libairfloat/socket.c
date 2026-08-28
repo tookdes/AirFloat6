@@ -747,8 +747,12 @@ void socket_close(struct socket_t* s) {
     if (!should_close)
         return;
     
-    if (socket_fd >= 0)
+    if (socket_fd >= 0) {
+        /* Wake workers blocked in recv/recvfrom/accept before joining them.
+           close() alone is not a reliable cross-thread cancellation primitive. */
+        shutdown(socket_fd, SHUT_RDWR);
         close(socket_fd);
+    }
     
     if (accept_thread != NULL)
         thread_destroy(accept_thread);
