@@ -46,8 +46,8 @@
 #define MAX_QUEUE_COUNT 4096
 #define CLIENT_SERVER_DIFFERENCE_BACKLOG 10
 #define LOOP_FROM(x, y, d, c) for (struct audio_packet_t* x = y ; x != c ; x = x->d)
-#define IS_UPPER(x) (((x % 0xFFFF) & 0x8000) != 0)
-#define IS_LOWER(x) (((x % 0xFFFF) & 0xC000) == 0)
+#define IS_UPPER(x) ((((uint16_t)(x)) & 0x8000U) != 0)
+#define IS_LOWER(x) ((((uint16_t)(x)) & 0xC000U) == 0)
 #define MIN(x,y) (x < y ? x : y)
 #define MAX(x,y) (x > y ? x : y)
 
