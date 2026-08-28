@@ -57,10 +57,10 @@ struct web_client_connection_t {
     } callbacks;
 };
 
-void _web_client_connection_send_next_request(struct web_client_connection_t* wc) {
+bool _web_client_connection_send_next_request(struct web_client_connection_t* wc) {
     
     if (wc == NULL)
-        return;
+        return false;
     
     socket_p failed_socket = NULL;
     web_client_connection_disconnected_callback disconnected_callback = NULL;
@@ -104,8 +104,11 @@ void _web_client_connection_send_next_request(struct web_client_connection_t* wc
         socket_destroy(failed_socket);
         if (disconnected_callback != NULL)
             disconnected_callback(wc, disconnected_callback_ctx);
+        /* The disconnected callback is allowed to destroy wc. */
+        return false;
     }
     
+    return true;
 }
 
 void _web_client_connection_socket_connected_callback(socket_p socket, void* ctx) {
@@ -168,11 +171,12 @@ ssize_t _web_client_connection_socket_receive_callback(socket_p socket, const vo
         }
         
         /* Send the next queued request while the connection is still known
-           to be alive. The response callback is allowed to destroy wc, so no
-           access to wc is permitted after invoking it. */
-        _web_client_connection_send_next_request(wc);
+           to be alive. A send failure can invoke the disconnected callback,
+           which may destroy wc; in that case do not pass the stale connection
+           to the response callback. */
+        bool connection_alive = _web_client_connection_send_next_request(wc);
         
-        if (response_callback != NULL)
+        if (connection_alive && response_callback != NULL)
             response_callback(wc, completed_request, response, response_callback_ctx);
         
         web_request_destroy(completed_request);
