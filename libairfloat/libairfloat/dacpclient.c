@@ -56,6 +56,7 @@ struct dacp_client_t {
     web_client_connection_p web_connection;
     web_client_connection_p pending_connection_destroy;
     uint32_t active_connection_users;
+    uint32_t active_callbacks;
     struct {
         dacp_client_controls_became_available_callback controls_became_available;
         dacp_client_controls_became_unavailable_callback controls_became_unavailable;
@@ -69,6 +70,30 @@ struct dacp_client_t {
     enum dacp_client_playback_state playback_state;
     bool is_destroyed;
 };
+
+static bool _dacp_client_begin_callback(struct dacp_client_t* dc) {
+    
+    if (dc == NULL || dc->mutex == NULL)
+        return false;
+    
+    mutex_lock(dc->mutex);
+    dc->active_callbacks++;
+    mutex_unlock(dc->mutex);
+    return true;
+}
+
+static void _dacp_client_end_callback(struct dacp_client_t* dc) {
+    
+    if (dc == NULL || dc->mutex == NULL)
+        return;
+    
+    mutex_lock(dc->mutex);
+    if (dc->active_callbacks > 0)
+        dc->active_callbacks--;
+    if (dc->active_callbacks == 0 && dc->connection_condition != NULL)
+        condition_broadcast(dc->connection_condition);
+    mutex_unlock(dc->mutex);
+}
 
 static web_client_connection_p _dacp_client_acquire_connection(struct dacp_client_t* dc) {
     
@@ -141,7 +166,7 @@ static web_client_connection_p _dacp_client_detach_connection(struct dacp_client
 void _dacp_client_web_connection_connected_callback(web_client_connection_p connection, void* ctx) {
     
     struct dacp_client_t* dc = (struct dacp_client_t*)ctx;
-    if (dc == NULL || dc->mutex == NULL)
+    if (!_dacp_client_begin_callback(dc))
         return;
     
     dacp_client_controls_became_available_callback callback = NULL;
@@ -158,23 +183,27 @@ void _dacp_client_web_connection_connected_callback(web_client_connection_p conn
         log_message(LOG_INFO, "Connected!");
         callback(dc, callback_ctx);
     }
+    
+    _dacp_client_end_callback(dc);
 }
 
 void _dacp_client_web_connection_connect_failed_callback(web_client_connection_p connection, void* ctx) {
     
     struct dacp_client_t* dc = (struct dacp_client_t*)ctx;
-    if (dc == NULL)
+    if (!_dacp_client_begin_callback(dc))
         return;
     
     web_client_connection_p destroy_connection = _dacp_client_detach_connection(dc, connection);
     if (destroy_connection != NULL)
         web_client_connection_destroy(destroy_connection);
+    
+    _dacp_client_end_callback(dc);
 }
 
 void _dacp_client_web_connection_disconnected_callback(web_client_connection_p connection, void* ctx) {
     
     struct dacp_client_t* dc = (struct dacp_client_t*)ctx;
-    if (dc == NULL || dc->mutex == NULL)
+    if (!_dacp_client_begin_callback(dc))
         return;
     
     web_client_connection_p destroy_connection = _dacp_client_detach_connection(dc, connection);
@@ -191,24 +220,31 @@ void _dacp_client_web_connection_disconnected_callback(web_client_connection_p c
     if (destroy_connection != NULL)
         web_client_connection_destroy(destroy_connection);
     
-    /* User code is invoked last. It may cause the owning RAOP session to be
-       torn down, so do not access dc after this call. */
     if (callback != NULL)
         callback(dc, callback_ctx);
+    
+    _dacp_client_end_callback(dc);
 }
 
 void _dacp_client_web_connection_response_received_callback(web_client_connection_p connection, web_request_p request, web_response_p response, void* ctx) {
     
     struct dacp_client_t* dc = (struct dacp_client_t*)ctx;
-    if (dc == NULL || dc->mutex == NULL || response == NULL)
+    if (!_dacp_client_begin_callback(dc))
         return;
+    
+    if (response == NULL) {
+        _dacp_client_end_callback(dc);
+        return;
+    }
     
     mutex_lock(dc->mutex);
     bool valid_connection = !dc->is_destroyed && dc->web_connection == connection;
     mutex_unlock(dc->mutex);
     
-    if (!valid_connection || web_response_get_status(response) != 200)
+    if (!valid_connection || web_response_get_status(response) != 200) {
+        _dacp_client_end_callback(dc);
         return;
+    }
     
     web_headers_p headers = web_response_get_headers(response);
     const char* s_content_type = web_headers_value(headers, "Content-Type");
@@ -216,12 +252,20 @@ void _dacp_client_web_connection_response_received_callback(web_client_connectio
     
     if (s_content_type == NULL ||
         strcmp(s_content_type, "application/x-dmap-tagged") != 0 ||
-        content_length == 0 || content_length > DACP_MAX_STATUS_RESPONSE_SIZE)
+        content_length == 0 || content_length > DACP_MAX_STATUS_RESPONSE_SIZE) {
+        _dacp_client_end_callback(dc);
         return;
+    }
     
     char* data = (char*)malloc(content_length);
-    if (data == NULL)
+    if (data == NULL) {
+        _dacp_client_end_callback(dc);
         return;
+    }
+    
+    dacp_client_playback_state_changed_callback callback = NULL;
+    void* callback_ctx = NULL;
+    enum dacp_client_playback_state callback_state = dacp_client_playback_state_stopped;
     
     if (web_response_get_content(response, data, content_length) == content_length) {
         dmap_p dmap = dmap_create();
@@ -231,19 +275,15 @@ void _dacp_client_web_connection_response_received_callback(web_client_connectio
             dmap_p container = dmap_container_for_atom_identifer(dmap, "com.airfloat.nowplayingcontainer");
             if (container != NULL) {
                 char now_playing = dmap_char_for_atom_identifer(container, "com.airfloat.nowplayingstatus");
-                dacp_client_playback_state_changed_callback callback = NULL;
-                void* callback_ctx = NULL;
                 
                 mutex_lock(dc->mutex);
                 if (!dc->is_destroyed && dc->web_connection == connection) {
                     dc->playback_state = now_playing;
                     callback = dc->callbacks.playback_state_changed;
                     callback_ctx = dc->callbacks.ctx.playback_state_changed;
+                    callback_state = now_playing;
                 }
                 mutex_unlock(dc->mutex);
-                
-                if (callback != NULL)
-                    callback(dc, now_playing, callback_ctx);
             }
             
             dmap_destroy(dmap);
@@ -251,13 +291,23 @@ void _dacp_client_web_connection_response_received_callback(web_client_connectio
     }
     
     free(data);
+    
+    if (callback != NULL)
+        callback(dc, callback_state, callback_ctx);
+    
+    _dacp_client_end_callback(dc);
 }
 
 void _dacp_client_zeroconf_resolved_callback(zeroconf_dacp_discover_p zeroconf_dacp_discover, const char* name, struct sockaddr** end_points, uint32_t end_points_count, void* ctx) {
     
     struct dacp_client_t* dc = (struct dacp_client_t*)ctx;
-    if (dc == NULL || dc->mutex == NULL || name == NULL || end_points == NULL)
+    if (!_dacp_client_begin_callback(dc))
         return;
+    
+    if (name == NULL || end_points == NULL) {
+        _dacp_client_end_callback(dc);
+        return;
+    }
     
     bool identifier_matches = false;
     
@@ -268,51 +318,52 @@ void _dacp_client_zeroconf_resolved_callback(zeroconf_dacp_discover_p zeroconf_d
         identifier_matches = true;
     mutex_unlock(dc->mutex);
     
-    if (!identifier_matches)
-        return;
-    
-    for (uint32_t i = 0 ; i < end_points_count ; i++) {
-        
-        if (end_points[i] == NULL)
-            continue;
-        
-        mutex_lock(dc->mutex);
-        bool host_matches = !dc->is_destroyed && dc->end_point != NULL && sockaddr_equals_host(end_points[i], dc->end_point);
-        mutex_unlock(dc->mutex);
-        
-        if (!host_matches)
-            continue;
-        
-        web_client_connection_p connection = web_client_connection_create();
-        if (connection == NULL)
+    if (identifier_matches) {
+        for (uint32_t i = 0 ; i < end_points_count ; i++) {
+            
+            if (end_points[i] == NULL)
+                continue;
+            
+            mutex_lock(dc->mutex);
+            bool host_matches = !dc->is_destroyed && dc->end_point != NULL && sockaddr_equals_host(end_points[i], dc->end_point);
+            mutex_unlock(dc->mutex);
+            
+            if (!host_matches)
+                continue;
+            
+            web_client_connection_p connection = web_client_connection_create();
+            if (connection == NULL)
+                break;
+            
+            web_client_connection_set_connected_callback(connection, _dacp_client_web_connection_connected_callback, dc);
+            web_client_connection_set_connect_failed_callback(connection, _dacp_client_web_connection_connect_failed_callback, dc);
+            web_client_connection_set_disconneced_callback(connection, _dacp_client_web_connection_disconnected_callback, dc);
+            web_client_connection_set_response_received_callback(connection, _dacp_client_web_connection_response_received_callback, dc);
+            
+            bool installed = false;
+            mutex_lock(dc->mutex);
+            if (!dc->is_destroyed && dc->web_connection == NULL && dc->pending_connection_destroy == NULL) {
+                dc->web_connection = connection;
+                dc->active_connection_users++;
+                installed = true;
+            }
+            mutex_unlock(dc->mutex);
+            
+            if (!installed) {
+                web_client_connection_destroy(connection);
+                break;
+            }
+            
+            /* socket_connect may synchronously report setup failure. The active
+               connection borrow keeps the web-client object alive until the
+               callback has detached it and this call has returned. */
+            web_client_connection_connect(connection, end_points[i]);
+            _dacp_client_release_connection(dc);
             break;
-        
-        web_client_connection_set_connected_callback(connection, _dacp_client_web_connection_connected_callback, dc);
-        web_client_connection_set_connect_failed_callback(connection, _dacp_client_web_connection_connect_failed_callback, dc);
-        web_client_connection_set_disconneced_callback(connection, _dacp_client_web_connection_disconnected_callback, dc);
-        web_client_connection_set_response_received_callback(connection, _dacp_client_web_connection_response_received_callback, dc);
-        
-        bool installed = false;
-        mutex_lock(dc->mutex);
-        if (!dc->is_destroyed && dc->web_connection == NULL && dc->pending_connection_destroy == NULL) {
-            dc->web_connection = connection;
-            dc->active_connection_users++;
-            installed = true;
         }
-        mutex_unlock(dc->mutex);
-        
-        if (!installed) {
-            web_client_connection_destroy(connection);
-            break;
-        }
-        
-        /* socket_connect may synchronously report setup failure. The active
-           connection borrow keeps the web-client object alive until the
-           callback has detached it and this call has returned. */
-        web_client_connection_connect(connection, end_points[i]);
-        _dacp_client_release_connection(dc);
-        break;
     }
+    
+    _dacp_client_end_callback(dc);
 }
 
 void _dacp_client_send_request(struct dacp_client_t* dc, const char* request_name) {
@@ -478,12 +529,12 @@ void dacp_client_destroy(struct dacp_client_t* dc) {
     mutex_unlock(dc->mutex);
     
     /* Stop discovery first so no new connection callback can be introduced
-       while the object is waiting for an in-flight DACP command to return. */
+       while the object is waiting for in-flight operations to return. */
     if (discover != NULL)
         zeroconf_dacp_discover_destroy(discover);
     
     mutex_lock(dc->mutex);
-    while (dc->active_connection_users > 0)
+    while (dc->active_connection_users > 0 || dc->active_callbacks > 0)
         condition_wait(dc->connection_condition, dc->mutex);
     
     if (dc->pending_connection_destroy != NULL) {
