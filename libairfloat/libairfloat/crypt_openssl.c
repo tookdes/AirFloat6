@@ -48,6 +48,7 @@ struct crypt_aes_t {
 
 static RSA* _private_key = NULL;
 static pthread_once_t _private_key_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t _private_key_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void _crypt_initialize_apple_private_key(void) {
     BIO* bio = BIO_new(BIO_s_mem());
@@ -79,7 +80,10 @@ size_t crypt_apple_private_encrypt(void* data, size_t data_size, void* encrypted
     if (key_size <= 0 || data_size != (size_t)key_size || encrypted_data_size < (size_t)key_size)
         return 0;
     
+    pthread_mutex_lock(&_private_key_mutex);
     int result = RSA_private_encrypt((int)data_size, data, encrypted_data, key, RSA_NO_PADDING);
+    pthread_mutex_unlock(&_private_key_mutex);
+    
     return result > 0 ? (size_t)result : 0;
 }
 
@@ -96,7 +100,10 @@ size_t crypt_apple_private_decrypt(void* encrypted_data, size_t encrypted_data_s
     if (key_size <= 0 || encrypted_data_size != (size_t)key_size || data_size < (size_t)key_size)
         return 0;
     
+    pthread_mutex_lock(&_private_key_mutex);
     int result = RSA_private_decrypt((int)encrypted_data_size, encrypted_data, data, key, RSA_PKCS1_OAEP_PADDING);
+    pthread_mutex_unlock(&_private_key_mutex);
+    
     return result > 0 ? (size_t)result : 0;
 }
 
