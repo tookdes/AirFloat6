@@ -860,15 +860,6 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
 
 -(void)stopHelperBackgroundTask {
     NSLog(@"stopHelperBackgroundTask called");
-    helperBackgroundTaskBlock = ^{
-        [[NSThread currentThread] setName:@"helperBackgroundTaskBlock.stopped"];
-        UIApplication* application = [UIApplication sharedApplication];
-        UIBackgroundTaskIdentifier expiredTask = helperBackgroundTask;
-        helperBackgroundTask = UIBackgroundTaskInvalid;
-        if (expiredTask != UIBackgroundTaskInvalid)
-            [application endBackgroundTask:expiredTask];
-    };
-    
     if (helperBackgroundTask != UIBackgroundTaskInvalid) {
         UIBackgroundTaskIdentifier identifier = helperBackgroundTask;
         helperBackgroundTask = UIBackgroundTaskInvalid;
@@ -878,17 +869,6 @@ dispatch_block_t helperBackgroundTaskBlock = ^{
 
 -(void)startHelperBackgroundTask {
     NSLog(@"startHelperBackgroundTask called");
-    if (!helperBackgroundTaskBlock) {
-        helperBackgroundTaskBlock = ^{
-            [[NSThread currentThread] setName:@"helperBackgroundTaskBlock.started"];
-            UIApplication* application = [UIApplication sharedApplication];
-            UIBackgroundTaskIdentifier expiredTask = helperBackgroundTask;
-            helperBackgroundTask = UIBackgroundTaskInvalid;
-            if (expiredTask != UIBackgroundTaskInvalid)
-                [application endBackgroundTask:expiredTask];
-        };
-    }
-    
     if (helperBackgroundTask != UIBackgroundTaskInvalid) {
         UIBackgroundTaskIdentifier identifier = helperBackgroundTask;
         helperBackgroundTask = UIBackgroundTaskInvalid;
