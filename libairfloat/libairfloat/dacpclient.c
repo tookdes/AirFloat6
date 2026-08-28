@@ -99,8 +99,13 @@ static void _dacp_client_release_connection(struct dacp_client_t* dc) {
         dc->active_connection_users--;
     
     if (dc->active_connection_users == 0) {
-        destroy_connection = dc->pending_connection_destroy;
-        dc->pending_connection_destroy = NULL;
+        /* During dacp_client_destroy(), leave the pending connection for the
+           owner thread. It must join/destroy the web client before dc itself
+           is freed, otherwise a callback worker could still hold dc as ctx. */
+        if (!dc->is_destroyed) {
+            destroy_connection = dc->pending_connection_destroy;
+            dc->pending_connection_destroy = NULL;
+        }
         if (dc->connection_condition != NULL)
             condition_broadcast(dc->connection_condition);
     }
