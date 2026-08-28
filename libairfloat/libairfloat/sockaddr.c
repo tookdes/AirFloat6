@@ -31,8 +31,39 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #include "sockaddr.h"
+
+static pthread_key_t _sockaddr_host_key;
+static pthread_once_t _sockaddr_host_key_once = PTHREAD_ONCE_INIT;
+
+static void _sockaddr_destroy_host_buffer(void* buffer) {
+    free(buffer);
+}
+
+static void _sockaddr_create_host_key(void) {
+    pthread_key_create(&_sockaddr_host_key, _sockaddr_destroy_host_buffer);
+}
+
+static char* _sockaddr_get_host_buffer(void) {
+    pthread_once(&_sockaddr_host_key_once, _sockaddr_create_host_key);
+    
+    char* buffer = (char*)pthread_getspecific(_sockaddr_host_key);
+    if (buffer != NULL)
+        return buffer;
+    
+    buffer = (char*)malloc(INET6_ADDRSTRLEN);
+    if (buffer == NULL)
+        return NULL;
+    
+    if (pthread_setspecific(_sockaddr_host_key, buffer) != 0) {
+        free(buffer);
+        return NULL;
+    }
+    
+    return buffer;
+}
 
 struct sockaddr* sockaddr_create(const char* host, uint16_t port, sockaddr_type version, uint32_t scope_id) {
     
@@ -121,17 +152,19 @@ bool sockaddr_equals_host(struct sockaddr* addr1, struct sockaddr* addr2) {
 
 const char* sockaddr_get_host(struct sockaddr* addr) {
     
-    static char ret[INET6_ADDRSTRLEN];
-    ret[0] = '\0';
-    
     if (addr == NULL)
         return NULL;
     
+    char* ret = _sockaddr_get_host_buffer();
+    if (ret == NULL)
+        return NULL;
+    ret[0] = '\0';
+    
     const char* result = NULL;
     if (addr->sa_family == AF_INET)
-        result = inet_ntop(AF_INET, &((struct sockaddr_in*)addr)->sin_addr, ret, sizeof(ret));
+        result = inet_ntop(AF_INET, &((struct sockaddr_in*)addr)->sin_addr, ret, INET6_ADDRSTRLEN);
     else if (addr->sa_family == AF_INET6)
-        result = inet_ntop(AF_INET6, &((struct sockaddr_in6*)addr)->sin6_addr, ret, sizeof(ret));
+        result = inet_ntop(AF_INET6, &((struct sockaddr_in6*)addr)->sin6_addr, ret, INET6_ADDRSTRLEN);
     
     return result != NULL ? ret : NULL;
 }
