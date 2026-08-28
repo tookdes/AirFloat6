@@ -79,6 +79,7 @@ static const int MAXIMUM_BACKGROUND_TASKS = 2;
 static int backgroundTaskTimeLimit = 0;
 static int backgroundTaskCount = 0;
 static BOOL clientIsStreaming = false;
+static BOOL recordingUIActive = false;
 
 UIBackgroundTaskIdentifier backgroundTask = UIBackgroundTaskInvalid;
 UIBackgroundTaskIdentifier helperBackgroundTask = UIBackgroundTaskInvalid;
@@ -111,11 +112,12 @@ void clientStartedRecording(raop_session_p raop_session, void* ctx) {
     
     AppViewController* viewController = (AppViewController*)ctx;
     
+    clientIsStreaming = true;
+    recordingUIActive = true;
+    
     dacp_client_p client = raop_session_get_dacp_client(raop_session);
     
     if (client != NULL) {
-        
-        clientIsStreaming = true;
         
         NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
         
@@ -136,6 +138,7 @@ void clientStartedRecording(raop_session_p raop_session, void* ctx) {
 void clientEndedRecording(raop_session_p raop_session, void* ctx) {
 
     AppViewController* viewController = (AppViewController*)ctx;
+    recordingUIActive = false;
 
     if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -160,18 +163,28 @@ void clientEndedRecording(raop_session_p raop_session, void* ctx) {
         });
     }
 
-    [viewController performSelectorOnMainThread:@selector(clientEndedRecording) withObject:nil waitUntilDone:NO];
+    /* The session destroys its DACP client immediately after teardown. Wait
+       until the main thread has dropped the raw pointer before returning. */
+    [viewController performSelectorOnMainThread:@selector(clientEndedRecording) withObject:nil waitUntilDone:YES];
 
 }
 
 void clientEnded(raop_session_p raop_session, void* ctx) {
     
     AppViewController* viewController = (AppViewController*)ctx;
+    BOOL wasStreaming = clientIsStreaming;
+    BOOL needsRecordingCleanup = recordingUIActive;
+    clientIsStreaming = false;
+    recordingUIActive = false;
     
-    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground && clientIsStreaming) {
-        clientIsStreaming = false;
+    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground && wasStreaming)
         [AirFloatSharedAppDelegate showNotification:@"Client disconnected."];
-    }
+    
+    /* Abrupt TCP/Wi-Fi loss bypasses the RTSP TEARDOWN handler and therefore
+       has no ended_recording callback. Perform the same cleanup synchronously
+       while the session's DACP object is still alive. */
+    if (needsRecordingCleanup)
+        [viewController performSelectorOnMainThread:@selector(clientEndedRecording) withObject:nil waitUntilDone:YES];
     
     [viewController performSelectorOnMainThread:@selector(clientEnded) withObject:nil waitUntilDone:NO];
     
@@ -567,6 +580,7 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
 - (void)clientEndedRecording {
     
     _dacp_client = NULL;
+    [self updateControlsAvailability];
     
     CGRect topViewFrame = self.topView.frame;
     topViewFrame.size.height = 48;
