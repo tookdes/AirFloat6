@@ -531,18 +531,33 @@ void socket_connect(struct socket_t* s, struct sockaddr* end_point) {
     if (s == NULL || end_point == NULL || s->is_connected || s->is_udp)
         return;
     
+    socket_connect_failed_callback connect_failed_callback = NULL;
+    void* connect_failed_callback_ctx = NULL;
+    
     if (s->socket < 0) {
         s->socket = socket(end_point->sa_family, SOCK_STREAM, IPPROTO_TCP);
         if (s->socket < 0) {
             log_message(LOG_ERROR, "Socket creation error: %s", strerror(errno));
+            connect_failed_callback = s->callbacks.connect_failed;
+            connect_failed_callback_ctx = s->callbacks.ctx.connect_failed;
+            if (connect_failed_callback != NULL)
+                connect_failed_callback(s, connect_failed_callback_ctx);
             return;
         }
         _socket_enable_tcp_keepalive(s->socket);
     }
     
     struct sockaddr* remote_end_point = sockaddr_copy(end_point);
-    if (remote_end_point == NULL)
+    if (remote_end_point == NULL) {
+        log_message(LOG_ERROR, "Unable to copy socket remote endpoint");
+        close(s->socket);
+        s->socket = -1;
+        connect_failed_callback = s->callbacks.connect_failed;
+        connect_failed_callback_ctx = s->callbacks.ctx.connect_failed;
+        if (connect_failed_callback != NULL)
+            connect_failed_callback(s, connect_failed_callback_ctx);
         return;
+    }
     
     if (s->remote_end_point != NULL)
         sockaddr_destroy(s->remote_end_point);
@@ -555,6 +570,11 @@ void socket_connect(struct socket_t* s, struct sockaddr* end_point) {
         s->socket = -1;
         sockaddr_destroy(s->remote_end_point);
         s->remote_end_point = NULL;
+        connect_failed_callback = s->callbacks.connect_failed;
+        connect_failed_callback_ctx = s->callbacks.ctx.connect_failed;
+        if (connect_failed_callback != NULL)
+            connect_failed_callback(s, connect_failed_callback_ctx);
+        return;
     }
     
 }
