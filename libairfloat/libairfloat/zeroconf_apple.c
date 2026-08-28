@@ -46,7 +46,7 @@
 
 #include "zeroconf.h"
 
-#define ZEROCONF_REGISTRATION_TIMEOUT_MS 5000
+#define ZEROCONF_REGISTRATION_GRACE_SECONDS 1.0
 
 static bool _zeroconf_cfstring_to_cstring(CFStringRef string, char* buffer, size_t buffer_size) {
     if (string == NULL || buffer == NULL || buffer_size == 0)
@@ -61,8 +61,8 @@ struct zeroconf_raop_ad_t {
     thread_p thread;
     mutex_p mutex;
     condition_p condition;
-    bool registration_complete;
-    bool registration_succeeded;
+    bool run_loop_ready;
+    bool registration_failed;
     uint16_t port;
 };
 
@@ -73,18 +73,34 @@ void _zeroconf_raop_ad_callback(CFNetServiceRef theService, CFStreamError* error
     if (za == NULL)
         return;
     
-    bool succeeded = (error == NULL || error->error == 0);
+    bool failed = (error != NULL && error->error != 0);
+    CFRunLoopRef run_loop = NULL;
     
     mutex_lock(za->mutex);
-    za->registration_complete = true;
-    za->registration_succeeded = succeeded;
+    if (failed)
+        za->registration_failed = true;
+    za->run_loop_ready = true;
+    run_loop = za->run_loop;
     condition_signal(za->condition);
     mutex_unlock(za->mutex);
     
-    if (succeeded)
-        log_message(LOG_INFO, "Zeroconf advertising started on port %d", za->port);
-    else
+    if (failed) {
         log_message(LOG_ERROR, "Could not start Zeroconf advertisement (domain %d / error %d)", (int)error->domain, (int)error->error);
+        if (run_loop != NULL)
+            CFRunLoopStop(run_loop);
+    } else
+        log_message(LOG_INFO, "Zeroconf advertising started on port %d", za->port);
+}
+
+void _zeroconf_raop_ad_run_loop_ready(CFRunLoopTimerRef timer, void *info) {
+    struct zeroconf_raop_ad_t* za = (struct zeroconf_raop_ad_t*)info;
+    if (za == NULL)
+        return;
+    
+    mutex_lock(za->mutex);
+    za->run_loop_ready = true;
+    condition_signal(za->condition);
+    mutex_unlock(za->mutex);
 }
 
 void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
@@ -112,8 +128,8 @@ void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
     
     if (!registration_started) {
         mutex_lock(za->mutex);
-        za->registration_complete = true;
-        za->registration_succeeded = false;
+        za->registration_failed = true;
+        za->run_loop_ready = true;
         condition_signal(za->condition);
         mutex_unlock(za->mutex);
         
@@ -121,8 +137,25 @@ void _zeroconf_raop_ad_run_loop_thread(void* ctx) {
             log_message(LOG_ERROR, "Unable to install Zeroconf registration callback");
         else
             log_message(LOG_ERROR, "Unable to start Zeroconf registration (domain %d / error %d)", (int)registration_error.domain, (int)registration_error.error);
-    } else
+    } else {
+        /* CFNetService's registration callback is specified primarily for
+           reporting registration errors, not as a guaranteed success event.
+           Give Bonjour a short error-reporting window, but never wait for a
+           success callback that may not be delivered. */
+        CFRunLoopTimerContext timer_context = { 0, za, NULL, NULL, NULL };
+        CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + ZEROCONF_REGISTRATION_GRACE_SECONDS, 0, 0, 0, _zeroconf_raop_ad_run_loop_ready, &timer_context);
+        if (timer != NULL) {
+            CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
+            CFRelease(timer);
+        } else {
+            mutex_lock(za->mutex);
+            za->run_loop_ready = true;
+            condition_signal(za->condition);
+            mutex_unlock(za->mutex);
+        }
+        
         CFRunLoopRun();
+    }
     
     if (client_set) {
         CFNetServiceUnscheduleFromRunLoop(za->service, run_loop, kCFRunLoopCommonModes);
@@ -221,20 +254,12 @@ struct zeroconf_raop_ad_t* zeroconf_raop_ad_create(uint16_t port, const char *na
         free(za);
         return NULL;
     }
-    
-    bool timed_out = false;
-    while (!za->registration_complete) {
-        if (condition_times_wait(za->condition, za->mutex, ZEROCONF_REGISTRATION_TIMEOUT_MS)) {
-            timed_out = true;
-            break;
-        }
-    }
-    bool registration_succeeded = za->registration_complete && za->registration_succeeded;
+    while (!za->run_loop_ready)
+        condition_wait(za->condition, za->mutex);
+    bool registration_failed = za->registration_failed;
     mutex_unlock(za->mutex);
     
-    if (!registration_succeeded) {
-        if (timed_out)
-            log_message(LOG_ERROR, "Timed out waiting for Zeroconf registration");
+    if (registration_failed) {
         zeroconf_raop_ad_destroy(za);
         return NULL;
     }
