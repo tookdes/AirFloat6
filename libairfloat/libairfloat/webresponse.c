@@ -200,7 +200,11 @@ ssize_t web_response_parse(web_response_p wr, const void* data, size_t data_size
         free(header);
         return -1;
     }
-    web_headers_parse(headers, headers_start, headers_length);
+    if (web_headers_parse(headers, headers_start, headers_length) == SIZE_MAX) {
+        web_headers_destroy(headers);
+        free(header);
+        return -1;
+    }
     
     size_t content_length = 0;
     if (!_web_response_parse_content_length(web_headers_value(headers, "Content-Length"), &content_length)) {
