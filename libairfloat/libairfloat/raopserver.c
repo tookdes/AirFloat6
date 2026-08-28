@@ -65,9 +65,13 @@ bool _raop_server_web_connection_accept_callback(web_server_p server, web_server
     void* accept_callback_ctx = NULL;
     
     mutex_lock(rs->mutex);
+    bool is_running = rs->is_running;
     accept_callback = rs->session_accept_callback;
     accept_callback_ctx = rs->session_accept_callback_ctx;
     mutex_unlock(rs->mutex);
+    
+    if (!is_running)
+        return false;
     
     if (accept_callback != NULL) {
         const char *ip = web_server_connection_get_host(connection);
@@ -84,13 +88,41 @@ bool _raop_server_web_connection_accept_callback(web_server_p server, web_server
     struct sockaddr* remote_end_point = web_server_connection_get_remote_end_point(connection);
     if (local_end_point != NULL && remote_end_point != NULL && !sockaddr_equals_host(local_end_point, remote_end_point)) {
 #endif
-        raop_session_p new_session = raop_session_create(rs, connection, rs->settings);
+        raop_session_p new_session = NULL;
+        raop_server_new_session_callback new_session_callback = NULL;
+        void* new_session_ctx = NULL;
+        
+        /* settings is owned by the server and may be replaced by the UI.
+           Copy it into the session while holding the same mutex used by
+           raop_server_set_settings(), but do not call user code under it. */
+        mutex_lock(rs->mutex);
+        if (rs->is_running) {
+            new_session = raop_session_create(rs, connection, rs->settings);
+            new_session_callback = rs->new_session_callback;
+            new_session_ctx = rs->new_session_ctx;
+        }
+        mutex_unlock(rs->mutex);
+        
         if (new_session == NULL) {
             log_message(LOG_ERROR, "Unable to create RAOP session");
             return false;
         }
         
+        /* The callback only configures the unpublished session. Keeping the
+           session out of rs->sessions here prevents a concurrent stop from
+           destroying it while user code is still installing callbacks. */
+        if (new_session_callback != NULL)
+            new_session_callback(rs, new_session, new_session_ctx);
+        
         mutex_lock(rs->mutex);
+        if (!rs->is_running) {
+            mutex_unlock(rs->mutex);
+            web_server_connection_set_request_callback(connection, NULL, NULL);
+            web_server_connection_set_closed_callback(connection, NULL, NULL);
+            raop_session_destroy(new_session);
+            return false;
+        }
+        
         raop_session_p* sessions = (raop_session_p*)realloc(rs->sessions, sizeof(raop_session_p) * (rs->sessions_count + 1));
         if (sessions == NULL) {
             mutex_unlock(rs->mutex);
@@ -106,14 +138,8 @@ bool _raop_server_web_connection_accept_callback(web_server_p server, web_server
         
         rs->sessions = sessions;
         rs->sessions[rs->sessions_count++] = new_session;
-        raop_server_new_session_callback new_session_callback = rs->new_session_callback;
-        void* new_session_ctx = rs->new_session_ctx;
-        mutex_unlock(rs->mutex);
-        
         raop_session_start(new_session);
-        
-        if (new_session_callback != NULL)
-            new_session_callback(rs, new_session, new_session_ctx);
+        mutex_unlock(rs->mutex);
         
         return true;
 #if (!defined(ALLOW_LOCALHOST))
@@ -244,10 +270,13 @@ void raop_server_set_settings(struct raop_server_t* rs, struct raop_server_setti
     
     mutex_lock(rs->mutex);
     const char* old_name = settings_get_name(rs->settings);
-    bool name_changed = (old_name == NULL || strcmp(old_name, requested_name) != 0);
+    bool requested_name_differs = (old_name == NULL || strcmp(old_name, requested_name) != 0);
     
     settings_set_name(rs->settings, settings.name);
     settings_set_password(rs->settings, settings.password);
+    
+    const char* current_name = settings_get_name(rs->settings);
+    bool name_changed = requested_name_differs && current_name != NULL && strcmp(current_name, requested_name) == 0;
     
     if (name_changed && rs->is_running) {
         struct sockaddr* local_end_point = web_server_get_local_end_point(rs->server, sockaddr_type_inet_4);
@@ -259,7 +288,7 @@ void raop_server_set_settings(struct raop_server_t* rs, struct raop_server_setti
         }
         
         if (port != 0)
-            rs->zeroconf_ad = zeroconf_raop_ad_create(port, settings_get_name(rs->settings));
+            rs->zeroconf_ad = zeroconf_raop_ad_create(port, current_name);
         
         if (rs->zeroconf_ad == NULL)
             log_message(LOG_ERROR, "Unable to refresh RAOP advertisement after settings change");
