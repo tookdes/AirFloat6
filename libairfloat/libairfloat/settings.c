@@ -1,5 +1,5 @@
 //
-//  settings_mac.c
+//  settings.c
 //  AirFloat
 //
 //  Copyright (c) 2013, Kristian Trenskow All rights reserved.
@@ -38,86 +38,92 @@ struct settings_t {
     char* password;
 };
 
+static char* _settings_copy_string(const char* value) {
+    if (value == NULL)
+        return NULL;
+    
+    size_t length = strlen(value);
+    char* copy = (char*)malloc(length + 1);
+    if (copy == NULL)
+        return NULL;
+    memcpy(copy, value, length + 1);
+    return copy;
+}
+
 struct settings_t* settings_create(const char* name, const char* password) {
     
-    struct settings_t* s = (struct settings_t*)malloc(sizeof(struct settings_t));
-    if (s == NULL)
+    struct settings_t* settings = (struct settings_t*)malloc(sizeof(struct settings_t));
+    if (settings == NULL)
         return NULL;
-    bzero(s, sizeof(struct settings_t));
+    settings->name = NULL;
+    settings->password = NULL;
     
-    settings_set_name(s, name);
-    if (s->name == NULL) {
-        free(s);
-        return NULL;
-    }
-    
-    settings_set_password(s, password);
-    if (password != NULL && s->password == NULL) {
-        free(s->name);
-        free(s);
+    const char* effective_name = (name != NULL && name[0] != '\0') ? name : "AirFloat";
+    settings->name = _settings_copy_string(effective_name);
+    if (settings->name == NULL) {
+        free(settings);
         return NULL;
     }
     
-    return s;
+    if (password != NULL && password[0] != '\0') {
+        settings->password = _settings_copy_string(password);
+        if (settings->password == NULL) {
+            free(settings->name);
+            free(settings);
+            return NULL;
+        }
+    }
     
+    return settings;
 }
 
-void settings_destroy(struct settings_t* s) {
+void settings_destroy(struct settings_t* settings) {
     
-    if (s == NULL)
+    if (settings == NULL)
         return;
     
-    free(s->name);
-    free(s->password);
-    free(s);
-    
+    free(settings->name);
+    free(settings->password);
+    free(settings);
 }
 
-const char* settings_get_name(struct settings_t* s) {
-    
-    return s != NULL ? s->name : NULL;
-    
+const char* settings_get_name(struct settings_t* settings) {
+    return settings != NULL ? settings->name : NULL;
 }
 
-void settings_set_name(struct settings_t* s, const char* new_name) {
+void settings_set_name(struct settings_t* settings, const char* name) {
     
-    if (s == NULL)
+    if (settings == NULL)
         return;
     
-    const char* s_name = new_name;
-    if (s_name == NULL || s_name[0] == '\0')
-        s_name = "AirFloat";
-    
-    char* replacement = (char*)malloc(strlen(s_name) + 1);
+    const char* effective_name = (name != NULL && name[0] != '\0') ? name : "AirFloat";
+    char* replacement = _settings_copy_string(effective_name);
     if (replacement == NULL)
         return;
-    strcpy(replacement, s_name);
     
-    free(s->name);
-    s->name = replacement;
-    
+    free(settings->name);
+    settings->name = replacement;
 }
 
-const char* settings_get_password(struct settings_t* s) {
-    
-    return s != NULL ? s->password : NULL;
-    
+const char* settings_get_password(struct settings_t* settings) {
+    return settings != NULL ? settings->password : NULL;
 }
 
-void settings_set_password(struct settings_t* s, const char* new_password) {
+void settings_set_password(struct settings_t* settings, const char* password) {
     
-    if (s == NULL)
+    if (settings == NULL)
         return;
     
-    char* replacement = NULL;
-    if (new_password != NULL) {
-        replacement = (char*)malloc(strlen(new_password) + 1);
-        if (replacement == NULL)
-            return;
-        strcpy(replacement, new_password);
+    if (password == NULL || password[0] == '\0') {
+        free(settings->password);
+        settings->password = NULL;
+        return;
     }
     
-    free(s->password);
-    s->password = replacement;
+    char* replacement = _settings_copy_string(password);
+    if (replacement == NULL)
+        return;
     
+    free(settings->password);
+    settings->password = replacement;
 }
