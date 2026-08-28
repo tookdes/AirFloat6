@@ -436,7 +436,13 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
             
             if (0 == strcmp(cmd, "OPTIONS"))
                 web_headers_set_value(response_headers, "Public", "ANNOUNCE, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER, POST, GET");
-            else if (0 == strcmp(cmd, "ANNOUNCE")) {
+            else if (0 == strcmp(cmd, "GET_PARAMETER")) {
+                /* Classic AirPlay uses GET_PARAMETER as an RTSP keep-alive,
+                   often with an empty body or a volume query. A 200 response
+                   is sufficient to keep the session alive even when no
+                   parameter value is returned. */
+                log_message(LOG_INFO, "Received GET_PARAMETER keep-alive");
+            } else if (0 == strcmp(cmd, "ANNOUNCE")) {
                 
                 mutex_lock(rs->mutex);
                 if (rs->dacp_client == NULL) {
