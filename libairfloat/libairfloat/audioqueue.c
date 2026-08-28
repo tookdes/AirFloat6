@@ -371,7 +371,8 @@ double _audio_queue_convert_time(struct audio_queue_t* aq, uint32_t from_sample_
     
     if (aq == NULL || aq->output_format.sample_rate == 0)
         return from_time;
-    return from_time + (((double)to_sample_time - (double)from_sample_time) / (double)aq->output_format.sample_rate);
+    int32_t sample_delta = (int32_t)(uint32_t)(to_sample_time - from_sample_time);
+    return from_time + ((double)sample_delta / (double)aq->output_format.sample_rate);
 }
 
 void _audio_queue_get_audio_buffer(struct audio_queue_t* aq, void* buffer, size_t size) {
@@ -598,7 +599,7 @@ void audio_queue_synchronize(struct audio_queue_t* aq, uint32_t current_sample_t
     current_sample_time -= 11025;
     
     if (aq->last_known_sample == 0 && aq->last_known_sample_time == 0) {
-        while (aq->queue_head && aq->queue_head->sample_time < current_sample_time)
+        while (aq->queue_head && (int32_t)(uint32_t)(aq->queue_head->sample_time - current_sample_time) < 0)
             audio_packet_destroy(_audio_queue_pop_packet_from_head(aq, true));
         
         audio_output_start(aq->output);
