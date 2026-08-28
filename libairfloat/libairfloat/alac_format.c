@@ -71,13 +71,13 @@ static bool _alac_format_parse_values(const char* rtp_fmtp, uint32_t values[11])
     if (*pos != '\0')
         return false;
     
-    /* Keep validation broad enough for legacy ALAC variants while rejecting
-       values that would overflow buffers or cannot fit the cookie fields. */
-    if (values[0] == 0 || values[0] > 65536 ||
+    /* This branch is a classic AirPlay receiver, not a general-purpose ALAC
+       decoder. Bound packet sizing and channel count to classic AirPlay use. */
+    if (values[0] == 0 || values[0] > 16384 ||
         values[1] > UINT8_MAX ||
         values[2] < 8 || values[2] > 32 || (values[2] % 8) != 0 ||
         values[3] > UINT8_MAX || values[4] > UINT8_MAX || values[5] > UINT8_MAX ||
-        values[6] == 0 || values[6] > 8 ||
+        values[6] == 0 || values[6] > 2 ||
         values[7] > UINT16_MAX ||
         values[10] < 8000 || values[10] > 192000)
         return false;
