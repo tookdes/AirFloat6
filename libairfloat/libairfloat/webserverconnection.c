@@ -203,12 +203,19 @@ void web_server_connection_send_response(web_server_connection_p wc, web_respons
     if (content_length > 0)
         web_response_get_content(response, buffer + response_length, content_length);
     
-    socket_send(wc->socket, buffer, total_length);
-    log_data(LOG_INFO, buffer, total_length);
+    /* Capture the socket before sending. A subsequent close may synchronously
+       tear down wc through the server callback chain, so do not touch wc after
+       socket_close below. */
+    socket_p socket = wc->socket;
+    ssize_t sent = socket_send(socket, buffer, total_length);
+    if (sent >= 0 && (size_t)sent == total_length)
+        log_data(LOG_INFO, buffer, total_length);
+    else
+        log_message(LOG_ERROR, "Incomplete RTSP response write (%d/%d bytes)", sent, total_length);
     free(buffer);
     
-    if (close_after_send)
-        socket_close(wc->socket);
+    if (close_after_send || sent < 0 || (size_t)sent != total_length)
+        socket_close(socket);
 }
 
 bool web_server_connection_is_connected(struct web_server_connection_t* wc) {
