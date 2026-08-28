@@ -45,6 +45,7 @@
 
 #define MAX_QUEUE_COUNT 4096
 #define CLIENT_SERVER_DIFFERENCE_BACKLOG 10
+#define RESEND_RETRY_INTERVAL_SECONDS 0.25
 #define LOOP_FROM(x, y, d, c) for (struct audio_packet_t* x = y ; x != c ; x = x->d)
 #define IS_UPPER(x) ((((uint16_t)(x)) & 0x8000U) != 0)
 #define IS_LOWER(x) ((((uint16_t)(x)) & 0xC000U) == 0)
@@ -74,6 +75,7 @@ struct audio_packet_t {
     uint16_t seq_no;
     uint32_t sample_time;
     double time;
+    double resend_requested_at;
     enum audio_packet_state state;
     struct audio_packet_t* next;
     struct audio_packet_t* previous;
@@ -383,7 +385,7 @@ void _audio_queue_get_audio_buffer(struct audio_queue_t* aq, void* buffer, size_
     while (buf_write_size > 0 && aq->queue_head != NULL) {
         struct audio_packet_t* audio_packet = aq->queue_head;
         
-        if (audio_packet->state == audio_packet_state_missing) {
+        if (audio_packet->state != audio_packet_state_complete) {
             log_message(LOG_INFO, "Missing package %d made it to playhead", audio_packet->seq_no);
             audio_output_set_muted(aq->output, true);
             aq->output_homed_at_host_time = hardware_get_time() + 1.0;
@@ -703,11 +705,23 @@ uint32_t audio_queue_add_packet(struct audio_queue_t* aq, void* encoded_buffer, 
                     return 0;
                 }
                 
-                for (uint32_t i = 0 ; i < (uint32_t)ret ; i++) {
-                    if (_audio_queue_add_empty_packet(aq) == NULL) {
-                        free(decoded_buffer);
-                        mutex_unlock(aq->mutex);
-                        return 0;
+                if ((uint32_t)ret >= MAX_QUEUE_COUNT) {
+                    log_message(LOG_INFO, "Resetting queue after oversized sequence gap (%d packets)", ret);
+                    while (aq->queue_head != NULL)
+                        audio_packet_destroy(_audio_queue_pop_packet_from_head(aq, false));
+                    aq->last_known_sample = aq->last_known_sample_time = 0;
+                    aq->output_is_homed = false;
+                    aq->output_homed_at_host_time = hardware_get_time() + 1.0;
+                    audio_output_set_muted(aq->output, true);
+                    audio_output_flush(aq->output);
+                    ret = 0;
+                } else {
+                    for (uint32_t i = 0 ; i < (uint32_t)ret ; i++) {
+                        if (_audio_queue_add_empty_packet(aq) == NULL) {
+                            free(decoded_buffer);
+                            mutex_unlock(aq->mutex);
+                            return 0;
+                        }
                     }
                 }
             } else if (aq->audio_received_callback != NULL)
@@ -752,6 +766,7 @@ uint32_t audio_queue_add_packet(struct audio_queue_t* aq, void* encoded_buffer, 
                             if (aq->missing_count > 0)
                                 aq->missing_count--;
                             current_packet->state = audio_packet_state_complete;
+                            current_packet->resend_requested_at = 0;
                         }
                     } else
                         log_message(LOG_INFO, "Packet %d already in queue", seq_no);
@@ -780,13 +795,23 @@ struct audio_queue_missing_packet_window audio_queue_get_next_missing_window(str
     mutex_lock(aq->mutex);
     
     if (!aq->destroyed && aq->missing_count < aq->queue_count / 2) {
+        double now = hardware_get_time();
         uint32_t queue_pos = 0;
         for (struct audio_packet_t* current_packet = aq->queue_head ; current_packet != NULL && queue_pos < aq->queue_count - aq->queue_count / 4 ; current_packet = current_packet->next) {
-            if (current_packet->state == audio_packet_state_missing) {
+            bool requestable = current_packet->state == audio_packet_state_missing ||
+                (current_packet->state == audio_packet_state_requested &&
+                 (current_packet->resend_requested_at <= 0 || now - current_packet->resend_requested_at >= RESEND_RETRY_INTERVAL_SECONDS));
+            if (requestable) {
                 ret.seq_no = current_packet->seq_no;
-                for (struct audio_packet_t* missing_packet = current_packet ; missing_packet != NULL && missing_packet->state == audio_packet_state_missing ; missing_packet = missing_packet->next) {
+                for (struct audio_packet_t* missing_packet = current_packet ; missing_packet != NULL ; missing_packet = missing_packet->next) {
+                    bool missing_requestable = missing_packet->state == audio_packet_state_missing ||
+                        (missing_packet->state == audio_packet_state_requested &&
+                         (missing_packet->resend_requested_at <= 0 || now - missing_packet->resend_requested_at >= RESEND_RETRY_INTERVAL_SECONDS));
+                    if (!missing_requestable)
+                        break;
                     ret.packet_count++;
                     missing_packet->state = audio_packet_state_requested;
+                    missing_packet->resend_requested_at = now;
                 }
                 break;
             }
