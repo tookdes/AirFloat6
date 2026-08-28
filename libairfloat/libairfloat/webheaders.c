@@ -19,8 +19,7 @@
 //  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
 //  PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
 //  OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-//  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-//  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
 //  OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 //  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
 //  STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
@@ -184,7 +183,7 @@ size_t web_headers_parse(struct web_headers_t* wh, void* buffer, size_t size) {
             
             char* storage = (char*)malloc(name_len + value_len + 2);
             if (storage == NULL)
-                return i + 1;
+                return SIZE_MAX;
             
             memcpy(storage, line, name_len);
             storage[name_len] = '\0';
@@ -194,7 +193,7 @@ size_t web_headers_parse(struct web_headers_t* wh, void* buffer, size_t size) {
             struct web_header_t* headers = (struct web_header_t*)realloc(wh->headers, sizeof(struct web_header_t) * (wh->count + 1));
             if (headers == NULL) {
                 free(storage);
-                return i + 1;
+                return SIZE_MAX;
             }
             wh->headers = headers;
             wh->headers[wh->count].name = storage;
