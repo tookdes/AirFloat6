@@ -221,6 +221,13 @@ void web_server_connection_take_off(struct web_server_connection_t* wc) {
     if (wc == NULL || wc->socket == NULL)
         return;
     
+    /* Read and log connection metadata before the receive worker starts. Once
+       that worker is running, an immediate peer disconnect may synchronously
+       destroy wc through the socket-closed callback chain. */
+    struct sockaddr* remote_end_point = socket_get_remote_end_point(wc->socket);
+    const char* ip = remote_end_point != NULL ? sockaddr_get_host(remote_end_point) : NULL;
+    log_message(LOG_INFO, "RAOPConnection (%p) took over connection from %s:%d", wc, (ip != NULL ? ip : "unknown"), (remote_end_point != NULL ? sockaddr_get_port(remote_end_point) : 0));
+    
     mutex_lock(wc->mutex);
     if (!wc->destroying) {
         wc->has_taken_off = true;
@@ -228,10 +235,6 @@ void web_server_connection_take_off(struct web_server_connection_t* wc) {
         socket_set_receive_callback(wc->socket, _web_server_connection_socket_recieve_callback, wc);
     }
     mutex_unlock(wc->mutex);
-    
-    struct sockaddr* remote_end_point = socket_get_remote_end_point(wc->socket);
-    const char* ip = remote_end_point != NULL ? sockaddr_get_host(remote_end_point) : NULL;
-    log_message(LOG_INFO, "RAOPConnection (%p) took over connection from %s:%d", wc, (ip != NULL ? ip : "unknown"), (remote_end_point != NULL ? sockaddr_get_port(remote_end_point) : 0));
 }
 
 void web_server_connection_close(struct web_server_connection_t* wc) {
