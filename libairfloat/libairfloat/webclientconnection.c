@@ -62,6 +62,10 @@ void _web_client_connection_send_next_request(struct web_client_connection_t* wc
     if (wc == NULL)
         return;
     
+    socket_p failed_socket = NULL;
+    web_client_connection_disconnected_callback disconnected_callback = NULL;
+    void* disconnected_callback_ctx = NULL;
+    
     mutex_lock(wc->mutex);
     
     if (!wc->destroying && wc->socket != NULL && socket_is_connected(wc->socket) && wc->requests_count > 0) {
@@ -73,7 +77,20 @@ void _web_client_connection_send_next_request(struct web_client_connection_t* wc
                 size_t written = web_request_write(wc->requests[0], data, request_len);
                 if (written == request_len) {
                     log_data(LOG_INFO, data, request_len);
-                    socket_send(wc->socket, data, request_len);
+                    ssize_t sent = socket_send(wc->socket, data, request_len);
+                    if (sent < 0 || (size_t)sent != request_len) {
+                        log_message(LOG_ERROR, "Incomplete DACP request write (%d/%d bytes)", sent, request_len);
+                        
+                        /* Do not close while wc->mutex is held: DACP's
+                           disconnected callback destroys this object. Detach
+                           the socket and suppress its callback first, then
+                           destroy it after releasing the client lock. */
+                        failed_socket = wc->socket;
+                        wc->socket = NULL;
+                        socket_set_closed_callback(failed_socket, NULL, NULL);
+                        disconnected_callback = wc->callbacks.disconnected;
+                        disconnected_callback_ctx = wc->callbacks.ctx.disconnected;
+                    }
                 }
                 free(data);
             }
@@ -82,6 +99,12 @@ void _web_client_connection_send_next_request(struct web_client_connection_t* wc
     }
     
     mutex_unlock(wc->mutex);
+    
+    if (failed_socket != NULL) {
+        socket_destroy(failed_socket);
+        if (disconnected_callback != NULL)
+            disconnected_callback(wc, disconnected_callback_ctx);
+    }
     
 }
 
