@@ -30,68 +30,43 @@
 
 #ifdef __APPLE__
 
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-
-#include <sys/socket.h>
-#include <net/if_dl.h>
-#include <ifaddrs.h>
+#include <stdint.h>
+#include <pthread.h>
 
 #include <mach/mach_time.h>
 
 #include "DeviceIDRetriver.h"
 
-bool _hardware_time_initiated = false;
-uint32_t _hardware_time_to_nanos_numerator;
-uint32_t _hardware_time_to_nanos_denominator;
+static pthread_once_t _hardware_time_once = PTHREAD_ONCE_INIT;
+static uint32_t _hardware_time_to_nanos_numerator = 1;
+static uint32_t _hardware_time_to_nanos_denominator = 1;
+
+static void _hardware_initialize_timebase(void) {
+    struct mach_timebase_info time_base_info;
+    if (mach_timebase_info(&time_base_info) == KERN_SUCCESS &&
+        time_base_info.numer != 0 && time_base_info.denom != 0) {
+        _hardware_time_to_nanos_numerator = time_base_info.numer;
+        _hardware_time_to_nanos_denominator = time_base_info.denom;
+    }
+}
 
 double hardware_host_time_to_seconds(double host_time) {
     
-    if (!_hardware_time_initiated) {
-        
-        struct mach_timebase_info time_base_info;
-        mach_timebase_info(&time_base_info);
-        _hardware_time_to_nanos_numerator = time_base_info.numer;
-        _hardware_time_to_nanos_denominator = time_base_info.denom;
-        
-    }
-    
-    return host_time / (double)_hardware_time_to_nanos_denominator * (double)_hardware_time_to_nanos_numerator / 1000000000.0;
+    pthread_once(&_hardware_time_once, _hardware_initialize_timebase);
+    return host_time / (double)_hardware_time_to_nanos_denominator *
+           (double)_hardware_time_to_nanos_numerator / 1000000000.0;
     
 }
 
 uint64_t hardware_identifier() {
     
-    uint64_t ret = 0;
-    
-    struct ifaddrs* if_addrs = NULL;
-    struct ifaddrs* if_addr = NULL;
-    
-    if (0 == getifaddrs(&if_addrs))
-        for (if_addr = if_addrs ; if_addr != NULL ; if_addr = if_addr->ifa_next) {
-            
-            if (if_addr->ifa_name != NULL && if_addr->ifa_addr->sa_family == AF_LINK && strcmp("en0", if_addr->ifa_name) == 0) {
-                
-                struct sockaddr_dl* sdl = (struct sockaddr_dl*)if_addr->ifa_addr;
-                if (sdl->sdl_alen == 6) {
-                    memcpy(&((char*)&ret)[2], LLADDR(sdl), sdl->sdl_alen);
-                    break;
-                }
-                
-            }
-            
-        }
-    
-    freeifaddrs(if_addrs);
-    
-    //return ret;
-    
-//}
-    
+    /* iOS 6 exposes identifierForVendor, which is the identity source this
+       branch has historically used. The previous en0 scan computed a MAC
+       value but discarded it, adding a null-address crash path for no effect. */
     return iOSDeviceID();
-  }
     
+}
+
 double hardware_get_time() {
     
     return hardware_host_time_to_seconds(mach_absolute_time());
