@@ -130,7 +130,7 @@ struct rtp_timing_packet_t {
 struct rtp_resent_packet_t {
     uint8_t a;
     uint8_t b;
-    uint16_t seq_num; /* Not used */
+    uint16_t seq_num; /* Request sequence number */
     uint16_t missed_seq;
     uint16_t count;
 };
@@ -267,7 +267,7 @@ void _rtp_recorder_send_resend_request(struct rtp_recorder_t* rr, uint16_t seq_n
     
     pckt.a = 0x80;
     pckt.b = RTP_RANGE_RESEND_REQUEST | ~RTP_PAYLOAD_TYPE;
-    pckt.seq_num = htons(count);
+    pckt.seq_num = htons(1);
     pckt.count = htons(count);
     pckt.missed_seq = htons(seq_num);
     
