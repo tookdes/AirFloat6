@@ -185,7 +185,7 @@ void clientUpdatedArtwork(raop_session_p raop_session, const void* data, size_t 
     
     UIImage* image = nil;
     
-    if (strcmp(mime_type, "image/none") != 0) {
+    if (mime_type != NULL && data != NULL && data_size > 0 && strcmp(mime_type, "image/none") != 0) {
         NSData* imageData = [[NSData alloc] initWithBytes:data length:data_size];
         image = [[UIImage imageWithData:imageData] imageWithScale:[UIScreen mainScreen].scale];
         [imageData release];
@@ -203,9 +203,12 @@ void clientUpdatedTrackInfo(raop_session_p raop_session, const char* title, cons
     
     AppViewController* viewController = (AppViewController*)ctx;
     
-    NSString* trackTitle = [[NSString alloc] initWithCString:title encoding:NSUTF8StringEncoding];
-    NSString* artistTitle = [[NSString alloc] initWithCString:artist encoding:NSUTF8StringEncoding];
-    NSString* albumTitle = [[NSString alloc] initWithCString:album encoding:NSUTF8StringEncoding];
+    const char* safeTitle = title != NULL ? title : "";
+    const char* safeArtist = artist != NULL ? artist : "";
+    const char* safeAlbum = album != NULL ? album : "";
+    NSString* trackTitle = [[NSString alloc] initWithCString:safeTitle encoding:NSUTF8StringEncoding];
+    NSString* artistTitle = [[NSString alloc] initWithCString:safeArtist encoding:NSUTF8StringEncoding];
+    NSString* albumTitle = [[NSString alloc] initWithCString:safeAlbum encoding:NSUTF8StringEncoding];
     
     NSInvocation* invocation = [NSInvocation invocationWithMethodSignature:[viewController methodSignatureForSelector:@selector(clientUpdatedTrackInfo:artistName:andAlbumTitle:)]];
     [invocation setSelector:@selector(clientUpdatedTrackInfo:artistName:andAlbumTitle:)];
@@ -219,6 +222,7 @@ void clientUpdatedTrackInfo(raop_session_p raop_session, const char* title, cons
     
     [trackTitle release];
     [artistTitle release];
+    [albumTitle release];
     
     [pool release];
     
@@ -655,7 +659,7 @@ void newServerSession(raop_server_p server, raop_session_p new_session, void* ct
     self.artistNameLabel.text = artistName;
     
     [_albumTitle release];
-    _albumTitle = albumTitle;
+    _albumTitle = [albumTitle retain];
     
     [self updateNowPlayingInfoCenter];
 }
