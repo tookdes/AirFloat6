@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <assert.h>
 #include <errno.h>
 
@@ -180,7 +181,11 @@ ssize_t web_request_parse(struct web_request_t* wr, const void* data, size_t dat
         free(header);
         return -1;
     }
-    web_headers_parse(headers, headers_start, headers_length);
+    if (web_headers_parse(headers, headers_start, headers_length) == SIZE_MAX) {
+        web_headers_destroy(headers);
+        free(header);
+        return -1;
+    }
     
     size_t content_length = 0;
     if (!_web_request_parse_content_length(web_headers_value(headers, "Content-Length"), &content_length)) {
