@@ -32,6 +32,7 @@
 
 #import <stdint.h>
 #import <stdbool.h>
+#import <unistd.h>
 
 #import <TargetConditionals.h>
 #import <AudioToolbox/AudioToolbox.h>
@@ -56,6 +57,8 @@ struct audio_output_t {
     AudioUnit output_unit;
     audio_output_callback callback;
     void* callback_ctx;
+    volatile int32_t active_render_callbacks;
+    volatile int32_t destroying;
 };
 
 void audio_output_stop(struct audio_output_t* ao);
@@ -137,21 +140,31 @@ static bool _audio_output_connect_unit(struct audio_output_t* ao, AUNode output_
 OSStatus _audio_unit_render_callback(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
     
     struct audio_output_t* ao = (struct audio_output_t*)inRefCon;
-    if (ao == NULL || ioData == NULL || ioData->mNumberBuffers == 0 || ioData->mBuffers[0].mData == NULL)
+    if (ao == NULL)
         return noErr;
+    
+    __sync_add_and_fetch(&ao->active_render_callbacks, 1);
+    
+    if (ioData == NULL || ioData->mNumberBuffers == 0 || ioData->mBuffers[0].mData == NULL) {
+        __sync_sub_and_fetch(&ao->active_render_callbacks, 1);
+        return noErr;
+    }
     
     bzero(ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize);
     
-    /* Do not assert or log from the real-time render callback. A transient
-       AudioUnit state error must not terminate the process or block audio. */
-    if (ao->mixer_unit != NULL)
-        AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 1.0, 0);
+    if (__sync_fetch_and_add(&ao->destroying, 0) == 0) {
+        /* Do not assert or log from the real-time render callback. A transient
+           AudioUnit state error must not terminate the process or block audio. */
+        if (ao->mixer_unit != NULL)
+            AudioUnitSetParameter(ao->mixer_unit, kMultiChannelMixerParam_Enable, kAudioUnitScope_Output, 0, 1.0, 0);
+        
+        audio_output_callback callback = ao->callback;
+        void* callback_ctx = ao->callback_ctx;
+        if (callback != NULL && inTimeStamp != NULL)
+            callback(ao, ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize, hardware_host_time_to_seconds(inTimeStamp->mHostTime), callback_ctx);
+    }
     
-    audio_output_callback callback = ao->callback;
-    void* callback_ctx = ao->callback_ctx;
-    if (callback != NULL && inTimeStamp != NULL)
-        callback(ao, ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize, hardware_host_time_to_seconds(inTimeStamp->mHostTime), callback_ctx);
-    
+    __sync_sub_and_fetch(&ao->active_render_callbacks, 1);
     return noErr;
 }
 
@@ -286,14 +299,23 @@ void audio_output_destroy(struct audio_output_t* ao) {
     if (ao == NULL)
         return;
     
+    if (__sync_lock_test_and_set(&ao->destroying, 1) != 0)
+        return;
+    
     audio_output_stop(ao);
+    
+    /* AUGraphStop prevents new render cycles. Drain any callback that had
+       already entered before disposing its AudioUnits or freeing inRefCon. */
+    while (__sync_fetch_and_add(&ao->active_render_callbacks, 0) > 0)
+        usleep(1000);
+    
     _audio_output_dispose(ao);
     free(ao);
 }
 
 void audio_output_set_callback(struct audio_output_t* ao, audio_output_callback callback, void* ctx) {
     
-    if (ao == NULL)
+    if (ao == NULL || __sync_fetch_and_add(&ao->destroying, 0) != 0)
         return;
     ao->callback = callback;
     ao->callback_ctx = ctx;
@@ -352,7 +374,7 @@ void audio_output_session_stop () {
 
 void audio_output_start(struct audio_output_t* ao) {
     
-    if (ao == NULL || ao->graph == NULL)
+    if (ao == NULL || ao->graph == NULL || __sync_fetch_and_add(&ao->destroying, 0) != 0)
         return;
     
 #if TARGET_OS_IPHONE
