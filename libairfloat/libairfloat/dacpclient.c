@@ -261,7 +261,16 @@ struct dacp_client_t* dacp_client_create(struct sockaddr* end_point, const char*
         free(dc);
         return NULL;
     }
-    zeroconf_dacp_discover_set_callback(dc->dacp_discover, _dacp_client_zeroconf_resolved_callback, dc);
+    
+    if (!zeroconf_dacp_discover_set_callback(dc->dacp_discover, _dacp_client_zeroconf_resolved_callback, dc)) {
+        zeroconf_dacp_discover_destroy(dc->dacp_discover);
+        dc->dacp_discover = NULL;
+        free(dc->identifier);
+        free(dc->active_remove);
+        sockaddr_destroy(dc->end_point);
+        free(dc);
+        return NULL;
+    }
     
     dc->playback_state = dacp_client_playback_state_stopped;
     
