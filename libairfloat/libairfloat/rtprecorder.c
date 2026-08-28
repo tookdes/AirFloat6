@@ -358,7 +358,10 @@ size_t _rtp_recorder_socket_data_received_airtunes_v2(struct rtp_recorder_t* rr,
         case RTP_AUDIO_RESEND_DATA:
             if (size >= 8) {
                 packet = _rtp_header_read((const uint8_t*)buffer + 4, size - 4);
-                log_message(LOG_INFO, "Received missing packet %d", packet.seq_num);
+                if (packet.packet_data != NULL && packet.packet_data_size > 8) {
+                    log_message(LOG_INFO, "Received missing packet %d", packet.seq_num);
+                    _rtp_recorder_process_audio_packet(rr, &packet);
+                }
             }
             break;
         case RTP_AUDIO_DATA:
