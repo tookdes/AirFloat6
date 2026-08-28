@@ -559,21 +559,33 @@ void socket_connect(struct socket_t* s, struct sockaddr* end_point) {
     
 }
 
-void socket_set_accept_callback(struct socket_t* s, socket_accept_callback callback, void* ctx) {
+bool socket_set_accept_callback(struct socket_t* s, socket_accept_callback callback, void* ctx) {
     
     if (s == NULL)
-        return;
+        return false;
     
     s->callbacks.accept = callback;
     s->callbacks.ctx.accept = ctx;
     
-    if (!s->is_udp && s->accept_thread == NULL) {
-        
-        if (listen(s->socket, 5) == 0)
-            s->accept_thread = thread_create_a(_socket_accept_loop, s);
-        
+    if (s->is_udp)
+        return false;
+    if (callback == NULL || s->accept_thread != NULL)
+        return true;
+    if (s->socket < 0)
+        return false;
+    
+    if (listen(s->socket, 5) != 0) {
+        log_message(LOG_ERROR, "Unable to listen on socket (%s)", strerror(errno));
+        return false;
     }
     
+    s->accept_thread = thread_create_a(_socket_accept_loop, s);
+    if (s->accept_thread == NULL) {
+        log_message(LOG_ERROR, "Unable to create socket accept worker");
+        return false;
+    }
+    
+    return true;
 }
 
 void socket_set_connected_callback(struct socket_t* s, socket_connected_callback callback, void* ctx) {
@@ -594,17 +606,26 @@ void socket_set_connect_failed_callback(struct socket_t* s, socket_connect_faile
     
 }
 
-void socket_set_receive_callback(struct socket_t* s, socket_receive_callback callback, void* ctx) {
+bool socket_set_receive_callback(struct socket_t* s, socket_receive_callback callback, void* ctx) {
     
     if (s == NULL)
-        return;
+        return false;
     
     s->callbacks.receive = callback;
     s->callbacks.ctx.receive = ctx;
     
-    if (s->receive_thread == NULL && (s->is_udp || s->is_connected))
-        s->receive_thread = thread_create_a(_socket_receive_loop, s);
+    if (callback == NULL || s->receive_thread != NULL)
+        return true;
     
+    if (s->is_udp || s->is_connected) {
+        s->receive_thread = thread_create_a(_socket_receive_loop, s);
+        if (s->receive_thread == NULL) {
+            log_message(LOG_ERROR, "Unable to create socket receive worker");
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 void socket_set_closed_callback(struct socket_t* s, socket_closed_callback callback, void* ctx) {
