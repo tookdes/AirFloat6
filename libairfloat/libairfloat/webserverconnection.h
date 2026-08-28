@@ -57,7 +57,7 @@ void web_server_connection_set_request_callback(web_server_connection_p wc, web_
 void web_server_connection_set_closed_callback(web_server_connection_p wc, web_server_connection_closed_callback closed_callback, void* ctx);
 void web_server_connection_send_response(web_server_connection_p wc, web_response_p response, const char* protocol, bool close_after_send);
 bool web_server_connection_is_connected(web_server_connection_p wc);
-void web_server_connection_take_off(struct web_server_connection_t* wc);
+bool web_server_connection_take_off(struct web_server_connection_t* wc);
 void web_server_connection_close(web_server_connection_p wc);
 struct sockaddr* web_server_connection_get_local_end_point(web_server_connection_p wc);
 struct sockaddr* web_server_connection_get_remote_end_point(web_server_connection_p wc);
