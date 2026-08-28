@@ -94,6 +94,11 @@ bool _raop_server_web_connection_accept_callback(web_server_p server, web_server
         raop_session_p* sessions = (raop_session_p*)realloc(rs->sessions, sizeof(raop_session_p) * (rs->sessions_count + 1));
         if (sessions == NULL) {
             mutex_unlock(rs->mutex);
+            /* raop_session_create installs callbacks on the web connection.
+               Remove them before freeing a session that was never published,
+               otherwise connection rollback can call a freed session. */
+            web_server_connection_set_request_callback(connection, NULL, NULL);
+            web_server_connection_set_closed_callback(connection, NULL, NULL);
             raop_session_destroy(new_session);
             log_message(LOG_ERROR, "Unable to store RAOP session");
             return false;
