@@ -28,7 +28,20 @@
 //  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 
-#if (!defined(__APPLE__) || defined(ALAC_SOFTWARE))
+/* The legacy Xcode project only compiles this decoder wrapper. Its ordinary
+   Debug configuration accidentally defines ALAC_SOFTWARE, while the explicit
+   "Debug (Server Logs - ALAC Software)" configuration defines both
+   ALAC_SOFTWARE and LOG_SERVER. Use Apple's bounded AudioConverter decoder for
+   every normal iOS build, and retain the old software decoder only for that
+   explicit diagnostic configuration and non-Apple platforms. */
+#if defined(__APPLE__) && !(defined(ALAC_SOFTWARE) && defined(LOG_SERVER))
+
+#ifdef ALAC_SOFTWARE
+#undef ALAC_SOFTWARE
+#endif
+#include "decoder_alac_apple.c"
+
+#else
 
 #include <stdlib.h>
 #include <stdint.h>
