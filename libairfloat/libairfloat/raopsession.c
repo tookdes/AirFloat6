@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <assert.h>
 #include <math.h>
@@ -179,7 +180,8 @@ void recorder_updated_track_position_callback(rtp_recorder_p rr, unsigned int cu
 
 bool _raop_session_check_authentication(struct raop_session_t* rs, const char* method, const char* uri, const char* authentication_parameter) {
     
-    assert(method != NULL && uri != NULL);
+    if (rs == NULL || method == NULL || uri == NULL)
+        return false;
     
     bool ret = (rs->password == NULL);
     
@@ -192,6 +194,10 @@ bool _raop_session_check_authentication(struct raop_session_t* rs, const char* m
             if (param_begin != NULL) {
                 
                 parameters_p parameters = parameters_create(param_begin, strlen(param_begin), parameters_type_http_authentication);
+                if (parameters == NULL) {
+                    log_message(LOG_INFO, "Unable to parse authentication header");
+                    return false;
+                }
                 
                 const char* nonce = parameters_value_for_key(parameters, "nonce");
                 const char* response = parameters_value_for_key(parameters, "response");
@@ -202,45 +208,63 @@ bool _raop_session_check_authentication(struct raop_session_t* rs, const char* m
                     strlen(nonce) == 32 && strlen(response) == 32 &&
                     strcmp(nonce, rs->authentication_digest_nonce) == 0) {
                     
-                    char w_response[33];
-                    strcpy(w_response, response);
+                    size_t username_len = strlen(username);
+                    size_t realm_len = strlen(realm);
+                    size_t password_len = strlen(rs->password);
+                    size_t method_len = strlen(method);
+                    size_t uri_len = strlen(uri);
                     
-                    size_t pw_len = strlen(rs->password);
+                    bool lengths_valid = username_len <= SIZE_MAX - realm_len - 3 &&
+                        username_len + realm_len + 3 <= SIZE_MAX - password_len &&
+                        method_len <= SIZE_MAX - uri_len - 2;
                     
-                    char a1pre[strlen(username) + strlen(realm) + pw_len + 3];
-                    sprintf(a1pre, "%s:%s:%s", username, realm, rs->password);
-                    
-                    char a2pre[strlen(method) + strlen(uri) + 2];
-                    sprintf(a2pre, "%s:%s", method, uri);
-                    
-                    uint16_t a1[16], a2[16];
-                    crypt_md5_hash(a1pre, strlen(a1pre), a1, 16);
-                    crypt_md5_hash(a2pre, strlen(a2pre), a2, 16);
-                    
-                    char ha1[33], ha2[33];
-                    ha1[32] = ha2[32] = '\0';
-                    hex_encode(a1, 16, ha1, 32);
-                    hex_encode(a2, 16, ha2, 32);
-                    
-                    char finalpre[67 + strlen(rs->authentication_digest_nonce)];
-                    sprintf(finalpre, "%s:%s:%s", ha1, rs->authentication_digest_nonce, ha2);
-                    
-                    uint16_t final[16];
-                    crypt_md5_hash(finalpre, strlen(finalpre), final, 16);
-                    
-                    char hfinal[33];
-                    hfinal[32] = '\0';
-                    hex_encode(final, 16, hfinal, 32);
-                    
-                    for (int i = 0 ; i < 32 ; i++) {
-                        hfinal[i] = tolower((unsigned char)hfinal[i]);
-                        w_response[i] = tolower((unsigned char)w_response[i]);
-                    }
-                    
-                    if (strcmp(hfinal, w_response) == 0)
-                        ret = true;
-                    else
-                        log_message(LOG_INFO, "Authentication failure");
+                    if (lengths_valid) {
+                        size_t a1pre_size = username_len + realm_len + password_len + 3;
+                        size_t a2pre_size = method_len + uri_len + 2;
+                        char* a1pre = (char*)malloc(a1pre_size);
+                        char* a2pre = (char*)malloc(a2pre_size);
+                        
+                        if (a1pre != NULL && a2pre != NULL) {
+                            snprintf(a1pre, a1pre_size, "%s:%s:%s", username, realm, rs->password);
+                            snprintf(a2pre, a2pre_size, "%s:%s", method, uri);
+                            
+                            unsigned char a1[16], a2[16];
+                            crypt_md5_hash(a1pre, strlen(a1pre), a1, sizeof(a1));
+                            crypt_md5_hash(a2pre, strlen(a2pre), a2, sizeof(a2));
+                            
+                            char ha1[33], ha2[33];
+                            ha1[32] = ha2[32] = '\0';
+                            hex_encode(a1, sizeof(a1), ha1, 32);
+                            hex_encode(a2, sizeof(a2), ha2, 32);
+                            
+                            char finalpre[99];
+                            snprintf(finalpre, sizeof(finalpre), "%s:%s:%s", ha1, rs->authentication_digest_nonce, ha2);
+                            
+                            unsigned char final[16];
+                            crypt_md5_hash(finalpre, strlen(finalpre), final, sizeof(final));
+                            
+                            char hfinal[33];
+                            char w_response[33];
+                            hfinal[32] = w_response[32] = '\0';
+                            hex_encode(final, sizeof(final), hfinal, 32);
+                            memcpy(w_response, response, 32);
+                            
+                            for (int i = 0 ; i < 32 ; i++) {
+                                hfinal[i] = (char)tolower((unsigned char)hfinal[i]);
+                                w_response[i] = (char)tolower((unsigned char)w_response[i]);
+                            }
+                            
+                            if (strcmp(hfinal, w_response) == 0)
+                                ret = true;
+                            else
+                                log_message(LOG_INFO, "Authentication failure");
+                        } else
+                            log_message(LOG_ERROR, "Unable to allocate authentication digest buffers");
+                        
+                        free(a1pre);
+                        free(a2pre);
+                    } else
+                        log_message(LOG_INFO, "Authentication header is too large");
                     
                 } else
                     log_message(LOG_INFO, "Malformed authentication header");
@@ -261,10 +285,13 @@ bool _raop_session_check_authentication(struct raop_session_t* rs, const char* m
 
 void _raop_session_get_apple_response(struct raop_session_t* rs, const char* challenge, size_t challenge_length, char* response, size_t* response_length) {
     
-    if (response_length != NULL)
+    size_t response_capacity = 0;
+    if (response_length != NULL) {
+        response_capacity = *response_length;
         *response_length = 0;
+    }
     
-    if (challenge == NULL || challenge_length == 0 || challenge_length > 128)
+    if (rs == NULL || challenge == NULL || challenge_length == 0 || challenge_length > 128 || response_length == NULL)
         return;
     
     char decoded_challenge[1000];
@@ -314,14 +341,18 @@ void _raop_session_get_apple_response(struct raop_session_t* rs, const char* cha
     
     if (size > 0) {
         
-        char* a_encrypted_response;
+        char* a_encrypted_response = NULL;
         size_t a_len = base64_encode(encrypted_response, size, &a_encrypted_response);
         
-        if (a_len != (size_t)-1) {
+        if (a_len != (size_t)-1 && a_encrypted_response != NULL) {
+            if (response != NULL && a_len > response_capacity) {
+                log_message(LOG_ERROR, "Apple response buffer is too small");
+                free(a_encrypted_response);
+                return;
+            }
             if (response != NULL)
                 memcpy(response, a_encrypted_response, a_len);
-            if (response_length != NULL)
-                *response_length = a_len;
+            *response_length = a_len;
             free(a_encrypted_response);
         }
         
@@ -343,12 +374,12 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
     
     struct raop_session_t* rs = (struct raop_session_t*)ctx;
     
-    int c_seq = 0;
     bool keep_alive = true;
     
     const char* cmd = web_request_get_command(request);
     const char* path = web_request_get_path(request);
     web_headers_p request_headers = web_request_get_headers(request);
+    const char* c_seq = web_headers_value(request_headers, "CSeq");
     
     web_response_p response = web_response_create();
     web_headers_p response_headers = web_response_get_headers(response);
@@ -399,7 +430,7 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
         mutex_unlock(rs->mutex);
         
         web_headers_set_value(response_headers, "Server", "AirTunes/105.1");
-        web_headers_set_value(response_headers, "CSeq", "%d", c_seq);
+        web_headers_set_value(response_headers, "CSeq", "%s", c_seq != NULL ? c_seq : "0");
         
         if (_raop_session_check_authentication(rs, cmd, path, web_headers_value(request_headers, "Authorization"))) {
             
@@ -558,10 +589,12 @@ void _raop_session_raop_connection_request_callback(web_server_connection_p conn
                                         
                                         size_t transport_reply_len = parameters_write(transport_params, NULL, 0, parameters_type_http_header);
                                         if (transport_reply_len > 0) {
-                                            char transport_reply[transport_reply_len];
-                                            parameters_write(transport_params, transport_reply, transport_reply_len, parameters_type_http_header);
-                                            web_headers_set_value(response_headers, "Transport", transport_reply);
-                                            setup_complete = true;
+                                            char* transport_reply = (char*)malloc(transport_reply_len);
+                                            if (transport_reply != NULL && parameters_write(transport_params, transport_reply, transport_reply_len, parameters_type_http_header) == transport_reply_len) {
+                                                web_headers_set_value(response_headers, "Transport", "%s", transport_reply);
+                                                setup_complete = true;
+                                            }
+                                            free(transport_reply);
                                         }
                                     }
                                     
@@ -762,9 +795,17 @@ struct raop_session_t* raop_session_create(raop_server_p server, web_server_conn
     
     const char* password = settings_get_password(settings);
     if (password != NULL && strlen(password) > 0) {
-        rs->password = (char*)malloc(strlen(password) + 1);
-        if (rs->password != NULL)
-            strcpy(rs->password, password);
+        size_t password_length = strlen(password);
+        if (password_length == SIZE_MAX) {
+            free(rs);
+            return NULL;
+        }
+        rs->password = (char*)malloc(password_length + 1);
+        if (rs->password == NULL) {
+            free(rs);
+            return NULL;
+        }
+        memcpy(rs->password, password, password_length + 1);
     }
     
     rs->mutex = mutex_create();
