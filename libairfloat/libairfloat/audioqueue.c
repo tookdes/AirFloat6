@@ -744,7 +744,7 @@ uint32_t audio_queue_add_packet(struct audio_queue_t* aq, void* encoded_buffer, 
             _audio_queue_add_packet_to_tail(aq, new_packet);
         } else {
             bool found = false;
-            LOOP_FROM(current_packet, aq->queue_tail, previous, aq->queue_head) {
+            for (struct audio_packet_t* current_packet = aq->queue_tail ; current_packet != NULL ; current_packet = current_packet->previous) {
                 if (current_packet->seq_no == seq_no) {
                     if (current_packet->state != audio_packet_state_complete) {
                         size_t old_size = current_packet->buffer_size;
