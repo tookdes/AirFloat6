@@ -33,7 +33,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdarg.h>
-#include <assert.h>
+#include <stdint.h>
 
 #include "log.h"
 
@@ -56,64 +56,65 @@ void _parameters_parse(struct parameters_t* p, const void* data, size_t data_siz
     
     size_t delimiter_length = strlen(delimiter);
     size_t key_value_seperator_length = strlen(key_value_seperator);
+    if (delimiter_length == 0 || key_value_seperator_length == 0)
+        return;
     
     const char* buffer = (const char*)data;
-    const char* line_start = buffer;
+    size_t line_start = 0;
+    size_t i = 0;
     
-    for (size_t i = 0 ; i <= data_size ; i++) {
+    while (i <= data_size) {
+        bool at_end = (i == data_size);
+        bool at_delimiter = (!at_end && i + delimiter_length <= data_size && memcmp(buffer + i, delimiter, delimiter_length) == 0);
         
-        size_t line_length = 0;
-        if ((i + delimiter_length <= data_size && memcmp(&buffer[i], delimiter, delimiter_length) == 0) || i == data_size) {
-            
-            line_length = buffer - line_start + i;
-            
-            if (line_length > 0) {
-                
-                struct parameter_t new_parameter = { NULL, NULL };
-                
-                new_parameter.key = (char*)malloc(line_length + 1);
-                if (new_parameter.key == NULL)
-                    return;
-                
-                memcpy(new_parameter.key, line_start, line_length);
-                new_parameter.key[line_length] = '\0';
-                new_parameter.value = strstr(new_parameter.key, key_value_seperator);
-                
-                if (new_parameter.value != NULL) {
-                    new_parameter.value[0] = '\0';
-                    new_parameter.value += key_value_seperator_length;
-                    if (new_parameter.value[0] == ' ')
-                        new_parameter.value++;
-                    if (new_parameter.value[0] == '\"') {
-                        new_parameter.value++;
-                        if (line_length > 0)
-                            new_parameter.key[line_length - 1] = '\0';
-                    }
-                }
-                
-                struct parameter_t* parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
-                if (parameters == NULL) {
-                    free(new_parameter.key);
-                    return;
-                }
-                p->parameters = parameters;
-                p->parameters[p->parameters_count] = new_parameter;
-                p->parameters_count++;
-                
-                /* There is no next field after the synthetic end-of-buffer
-                   delimiter. Do not advance line_start beyond the input. */
-                if (i < data_size) {
-                    line_start += line_length + delimiter_length;
-                    if (line_start < buffer + data_size && line_start[0] == ' ')
-                        line_start++;
-                }
-                
-            }
-            
+        if (!at_end && !at_delimiter) {
+            i++;
+            continue;
         }
         
-    }
+        size_t line_length = i - line_start;
+        if (line_length > 0) {
+            struct parameter_t new_parameter = { NULL, NULL };
+            
+            new_parameter.key = (char*)malloc(line_length + 1);
+            if (new_parameter.key == NULL)
+                return;
+            
+            memcpy(new_parameter.key, buffer + line_start, line_length);
+            new_parameter.key[line_length] = '\0';
+            new_parameter.value = strstr(new_parameter.key, key_value_seperator);
+            
+            if (new_parameter.value != NULL) {
+                new_parameter.value[0] = '\0';
+                new_parameter.value += key_value_seperator_length;
+                if (new_parameter.value[0] == ' ')
+                    new_parameter.value++;
+                if (new_parameter.value[0] == '\"') {
+                    new_parameter.value++;
+                    if (line_length > 0)
+                        new_parameter.key[line_length - 1] = '\0';
+                }
+            }
+            
+            struct parameter_t* parameters = (struct parameter_t*)realloc(p->parameters, sizeof(struct parameter_t) * (p->parameters_count + 1));
+            if (parameters == NULL) {
+                free(new_parameter.key);
+                return;
+            }
+            p->parameters = parameters;
+            p->parameters[p->parameters_count] = new_parameter;
+            p->parameters_count++;
+        }
         
+        if (at_end)
+            break;
+        
+        i += delimiter_length;
+        if (i < data_size && buffer[i] == ' ')
+            i++;
+        line_start = i;
+    }
+    
 }
 
 void _parameters_parse_http_authentication(struct parameters_t* p, const void* buffer, size_t size) {
@@ -138,22 +139,32 @@ void _parameters_parse_http_authentication(struct parameters_t* p, const void* b
         }
         
         size_t key_len = strlen(p->parameters[i].key);
-        size_t total_len = key_len + strlen(p->parameters[i].value);
+        value_len = strlen(p->parameters[i].value);
+        if (key_len > SIZE_MAX - value_len - 2)
+            return;
+        size_t total_len = key_len + value_len;
         
-        char tmp_buf[total_len + 2];
+        char* tmp_buf = (char*)malloc(total_len + 2);
+        if (tmp_buf == NULL)
+            return;
+        
         if (key_len > 0 && p->parameters[i].key[0] == ' ') {
-            total_len--; key_len--;
+            total_len--;
+            key_len--;
             memcpy(tmp_buf, &p->parameters[i].key[1], key_len);
-        } else
+        } else if (key_len > 0)
             memcpy(tmp_buf, p->parameters[i].key, key_len);
         
         tmp_buf[key_len] = '\0';
         
-        memcpy(&tmp_buf[key_len+1], p->parameters[i].value, total_len - key_len);
+        size_t normalized_value_len = total_len - key_len;
+        if (normalized_value_len > 0)
+            memcpy(&tmp_buf[key_len + 1], p->parameters[i].value, normalized_value_len);
         tmp_buf[total_len + 1] = '\0';
         
         memcpy(p->parameters[i].key, tmp_buf, total_len + 2);
-        p->parameters[i].value = &p->parameters[i].key[key_len+1];
+        p->parameters[i].value = &p->parameters[i].key[key_len + 1];
+        free(tmp_buf);
         
     }
     
@@ -259,7 +270,8 @@ uint32_t parameters_get_count(struct parameters_t* p) {
 
 const char* parameters_key_at_index(struct parameters_t* p, uint32_t index) {
     
-    assert(p != NULL && index < p->parameters_count);
+    if (p == NULL || index >= p->parameters_count)
+        return NULL;
     
     return p->parameters[index].key;
     
@@ -280,7 +292,8 @@ const char* parameters_value_for_key(struct parameters_t* p, const char* key) {
 
 void parameters_set_value(struct parameters_t* p, const char* key, const char* value, ...) {
     
-    assert(p != NULL && key != NULL && value != NULL);
+    if (p == NULL || key == NULL || value == NULL)
+        return;
     
     char new_value[100];
     bzero(new_value, 100);
@@ -349,11 +362,8 @@ size_t parameters_write(struct parameters_t* p, void* buffer, size_t buffer_size
     switch (type) {
         case parameters_type_http_header:
             return _parameters_write_http_header(p, buffer, buffer_size);
-            break;
         default:
-            assert("Write out of type is not implemented");
+            log_message(LOG_ERROR, "Parameter serialization type is not implemented");
+            return 0;
     }
-    
-    return 0;
-    
 }
